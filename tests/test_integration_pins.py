@@ -393,7 +393,7 @@ async def test_snapshot_lists_third_party_custom_integrations(
     snap = (await client.receive_json())["result"]
 
     assert snap["custom_integrations"] == [
-        {"domain": "my_hack", "version": "0.1.0", "source": "manual", "source_detail": ""}
+        {"domain": "my_hack", "version": "0.1.0", "source": "unknown", "source_detail": ""}
     ]
 
 

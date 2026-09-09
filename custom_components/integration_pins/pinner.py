@@ -721,7 +721,7 @@ def _hacs_sources(config_dir: str) -> dict[str, str]:
 
 def _source_of(domain: str, hacs: dict[str, str]) -> dict[str, str]:
     repo = hacs.get(domain)
-    return {"source": "hacs" if repo else "manual", "source_detail": repo or ""}
+    return {"source": "hacs" if repo else "unknown", "source_detail": repo or ""}
 
 
 def list_custom_integrations(config_dir: str, exclude: set[str]) -> list[dict[str, Any]]:

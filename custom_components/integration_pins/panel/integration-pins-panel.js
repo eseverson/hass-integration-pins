@@ -747,7 +747,7 @@ class IntegrationPinsPanel extends HTMLElement {
           <div class="cell mono">${esc(o.manifest_version || "?")}</div>
           <div class="cell">${hacs
             ? `<span class="chip hacs">HACS</span> <span class="mono small">${esc(o.source_detail)}</span>`
-            : `<span class="muted small">manual / unknown</span>`}</div>
+            : `<span class="muted small">unknown</span>`}</div>
           <div class="cell muted small">${hacs
             ? `HACS installs and updates this. Adopting it would put two things in charge of the same directory — leave it to HACS unless you have uninstalled it there.`
             : `custom_components/${esc(o.domain)} shadows the bundled integration but is not managed here.`}</div>
@@ -817,7 +817,7 @@ class IntegrationPinsPanel extends HTMLElement {
           <div class="cell mono">${esc(c.version || "?")}</div>
           <div class="cell">${c.source === "hacs"
             ? `<span class="chip hacs">HACS</span> <span class="mono small">${esc(c.source_detail)}</span>`
-            : `<span class="muted small">manual / unknown</span>`}</div>
+            : `<span class="muted small">unknown</span>`}</div>
         </div>`).join("");
     return `
       <ha-card header="Other custom integrations">
