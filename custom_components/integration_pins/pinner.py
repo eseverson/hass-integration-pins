@@ -75,6 +75,7 @@ class WheelInfo:
     url: str
     sha256: str
     size: int
+    released: str = ""  # YYYY-MM-DD the release went to PyPI, within minutes of its tag
 
 
 # ---------------------------------------------------------------------------
@@ -84,14 +85,19 @@ class WheelInfo:
 
 async def async_list_versions(
     session: aiohttp.ClientSession, include_prereleases: bool = False
-) -> list[str]:
-    """Return Home Assistant release versions available on PyPI, newest first."""
+) -> dict[str, str]:
+    """Home Assistant releases on PyPI, newest first, mapped to the date they shipped.
+
+    The date comes free with the listing and is what turns a release into a point in the
+    upstream history: GitHub's commits page filters by path and date, so it answers
+    "what changed in this integration since then" without another request.
+    """
     async with session.get(PYPI_JSON_URL, timeout=aiohttp.ClientTimeout(total=30)) as resp:
         if resp.status != 200:
             raise PinError(f"PyPI returned HTTP {resp.status} listing releases")
         data = await resp.json()
 
-    versions: list[Version] = []
+    released: dict[Version, str] = {}
     for raw, files in data.get("releases", {}).items():
         try:
             ver = Version(raw)
@@ -103,8 +109,14 @@ async def async_list_versions(
             continue
         if not any(f.get("packagetype") == "bdist_wheel" and not f.get("yanked") for f in files):
             continue
-        versions.append(ver)
-    return [str(v) for v in sorted(versions, reverse=True)]
+        released[ver] = _upload_date(files)
+    return {str(v): released[v] for v in sorted(released, reverse=True)}
+
+
+def _upload_date(files: list[dict[str, Any]]) -> str:
+    stamps = [f.get("upload_time_iso_8601") or "" for f in files]
+    earliest = min((s for s in stamps if s), default="")
+    return earliest[:10]
 
 
 async def async_get_wheel(session: aiohttp.ClientSession, version: str) -> WheelInfo:
@@ -123,6 +135,7 @@ async def async_get_wheel(session: aiohttp.ClientSession, version: str) -> Wheel
                 url=file["url"],
                 sha256=file.get("digests", {}).get("sha256", ""),
                 size=int(file.get("size", 0)),
+                released=(file.get("upload_time_iso_8601") or "")[:10],
             )
     raise PinError(f"No wheel found on PyPI for Home Assistant {version}")
 
@@ -162,6 +175,7 @@ class GitSource:
     ref: str  # what was asked for: a branch, a tag or a commit
     sha: str  # the commit it resolved to
     core_version: str  # the core version that commit builds
+    date: str = ""  # YYYY-MM-DD the commit was made
 
     @property
     def version(self) -> str:
@@ -217,7 +231,10 @@ async def async_resolve_git_source(session: aiohttp.ClientSession, ref: str) -> 
             raise PinError(f"Could not read the core version at {sha[:7]}")
         const_py = await resp.text()
 
-    return GitSource(ref=ref, sha=sha, core_version=_parse_core_version(const_py))
+    committed = (data.get("commit", {}).get("committer", {}).get("date") or "")[:10]
+    return GitSource(
+        ref=ref, sha=sha, core_version=_parse_core_version(const_py), date=committed
+    )
 
 
 async def async_git_component(

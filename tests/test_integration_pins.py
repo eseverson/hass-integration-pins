@@ -34,7 +34,7 @@ async def setup(hass: HomeAssistant, tmp_path: Path):
     return entry
 
 
-def _mock_pypi(aioclient_mock, fake_wheel: Path, version: str = FAKE_VERSION):
+def _mock_pypi(aioclient_mock, fake_wheel: Path, version: str = FAKE_VERSION, released: str = ""):
     data = fake_wheel.read_bytes()
     aioclient_mock.get(
         f"https://pypi.org/pypi/homeassistant/{version}/json",
@@ -45,6 +45,7 @@ def _mock_pypi(aioclient_mock, fake_wheel: Path, version: str = FAKE_VERSION):
                     "url": f"https://files.example/ha-{version}.whl",
                     "digests": {"sha256": hashlib.sha256(data).hexdigest()},
                     "size": len(data),
+                    "upload_time_iso_8601": released,
                 }
             ]
         },
@@ -696,8 +697,11 @@ FAKE_CONST_PY = (
 )
 
 
-def _mock_github_ref(aioclient_mock, ref="dev", sha=FAKE_SHA):
-    aioclient_mock.get(f"{GH_API}/commits/{ref}", json={"sha": sha})
+def _mock_github_ref(aioclient_mock, ref="dev", sha=FAKE_SHA, date=""):
+    aioclient_mock.get(
+        f"{GH_API}/commits/{ref}",
+        json={"sha": sha, "commit": {"committer": {"date": date}}},
+    )
     aioclient_mock.get(f"{GH_RAW}/{sha}/homeassistant/const.py", text=FAKE_CONST_PY)
 
 
@@ -979,3 +983,60 @@ async def test_snapshot_advertises_what_this_backend_can_do(
 
     assert snap["features"] == list(FEATURES)
     assert "git" in snap["features"]
+
+
+async def test_version_listing_carries_release_dates(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    """The dates come free with the version list, and turn into 'what changed since' links."""
+    aioclient_mock.get(
+        "https://pypi.org/pypi/homeassistant/json",
+        json={
+            "releases": {
+                "2026.2.3": [
+                    {
+                        "packagetype": "bdist_wheel",
+                        "upload_time_iso_8601": "2026-02-20T21:03:06.197770Z",
+                    }
+                ],
+                "2025.12.3": [{"packagetype": "bdist_wheel"}],
+            }
+        },
+    )
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/versions"})
+    result = (await client.receive_json())["result"]
+
+    assert result["versions"] == ["2026.2.3", "2025.12.3"]
+    assert result["released"]["2026.2.3"] == "2026-02-20"
+    assert result["released"]["2025.12.3"] == ""
+
+
+async def test_compare_reports_when_the_candidate_shipped(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel
+):
+    _mock_pypi(aioclient_mock, fake_wheel, released="2025-12-09T11:00:00.000000Z")
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    result = (await client.receive_json())["result"]
+
+    assert result["since"] == "2025-12-09"
+
+
+async def test_compare_against_git_reports_the_commit_date(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    _mock_github_ref(aioclient_mock, date="2026-09-08T10:11:12Z")
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, {"manifest.json": b'{"domain": "sun"}'})
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "git_ref": "dev"}
+    )
+    result = (await client.receive_json())["result"]
+
+    assert result["since"] == "2026-09-08"

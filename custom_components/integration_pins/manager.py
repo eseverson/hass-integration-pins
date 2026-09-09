@@ -161,6 +161,7 @@ class PinManager:
                 await pinner.async_git_component(session, source, domain)
             )
             label = f"{source.ref} @ {source.sha[:7]}"
+            since = source.date
         else:
             pinner.parse_version(version)
             wheel = await pinner.async_get_wheel(session, version)
@@ -168,6 +169,7 @@ class PinManager:
             if not candidate:
                 raise PinError(f"Home Assistant {version} has no core integration '{domain}'")
             label = version
+            since = wheel.released
 
         base, compared_with = await self._async_baseline(domain, session)
         result = pinner.compare_digests(base, candidate)
@@ -176,6 +178,7 @@ class PinManager:
             "domain": domain,
             "version": label,
             "compared_with": compared_with,
+            "since": since,
             "identical": not (result["added"] or result["removed"] or result["changed"]),
         }
 
@@ -216,7 +219,7 @@ class PinManager:
         digest = await self.hass.async_add_executor_job(pinner.local_component_digest, path)
         return digest, f"core {CORE_VERSION}"
 
-    async def async_versions(self, include_prereleases: bool) -> list[str]:
+    async def async_versions(self, include_prereleases: bool) -> dict[str, str]:
         session = async_get_clientsession(self.hass)
         return await pinner.async_list_versions(session, include_prereleases)
 

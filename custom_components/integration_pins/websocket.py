@@ -115,8 +115,10 @@ async def ws_domain_info(hass, connection, msg: dict[str, Any]) -> None:
 @websocket_api.async_response
 @_wrap
 async def ws_versions(hass, connection, msg: dict[str, Any]) -> None:
-    versions = await _manager(hass).async_versions(msg["include_prereleases"])
-    connection.send_result(msg["id"], {"versions": versions})
+    released = await _manager(hass).async_versions(msg["include_prereleases"])
+    connection.send_result(
+        msg["id"], {"versions": list(released), "released": released}
+    )
 
 
 @websocket_api.require_admin

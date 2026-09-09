@@ -55,6 +55,7 @@ class IntegrationPinsPanel extends HTMLElement {
     this._gitRef = "dev";
     this._fieldErrors = {}; // field name -> message, shown against the input itself
     this._versions = [];
+    this._released = {}; // version -> YYYY-MM-DD it shipped, for "changed since" links
     this._prereleases = false;
     this._busy = null; // text shown while a long operation runs
     this._error = null;
@@ -116,8 +117,10 @@ class IntegrationPinsPanel extends HTMLElement {
         include_prereleases: this._prereleases,
       });
       this._versions = r.versions;
+      this._released = r.released || {};
     } catch (e) {
       this._versions = [];
+    this._released = {}; // version -> YYYY-MM-DD it shipped, for "changed since" links
       this._error = `Could not list releases from PyPI: ${e.message || e}`;
     }
     this._render();
@@ -225,8 +228,17 @@ class IntegrationPinsPanel extends HTMLElement {
         </div>`;
     }
     const total = c.added.length + c.removed.length + c.changed.length;
+    const shown = (names) => names.slice(0, 12);
+    const more = (names) => (names.length > 12 ? ` <span class="muted">+${names.length - 12} more</span>` : "");
     const list = (label, names) => names.length
-      ? `<div><span class="muted">${label}</span> <span class="mono small">${esc(names.slice(0, 12).join(", "))}${names.length > 12 ? `, +${names.length - 12} more` : ""}</span></div>`
+      ? `<div><span class="muted">${label}</span> <span class="mono small">${esc(shown(names).join(", "))}${names.length > 12 ? `, +${names.length - 12} more` : ""}</span></div>`
+      : "";
+    // Only the changed files are linked: they exist on both sides, so the path is
+    // certain to resolve upstream. Added and removed ones may not.
+    const changedList = c.changed.length
+      ? `<div><span class="muted">changed:</span> <span class="mono small">${shown(c.changed)
+          .map((f) => this._historyLink(`homeassistant/components/${c.domain}/${f}`, f, "dev", c.since))
+          .join(" · ")}</span>${more(c.changed)}</div>`
       : "";
     return `
       <div class="info-box">
@@ -234,7 +246,7 @@ class IntegrationPinsPanel extends HTMLElement {
         <div>
           <div><strong>${total}</strong> file${total === 1 ? "" : "s"} differ between
           ${esc(c.version)} and ${esc(c.compared_with)} (${c.unchanged} unchanged).</div>
-          ${list("changed:", c.changed)}
+          ${changedList}
           ${list("only in " + c.version + ":", c.added)}
           ${list("only in " + c.compared_with + ":", c.removed)}
         </div>
@@ -384,20 +396,31 @@ class IntegrationPinsPanel extends HTMLElement {
       </div>`;
   }
 
-  /* The upstream history is the fastest way to see what changed in an integration:
-   * `latest` puts the commits made since your release at the top, and the tag link
-   * shows the code as it stood in the release you are about to pin. */
+  /* GitHub has no path-filtered compare -- comparing two refs across all of core is so
+   * large it refuses to render -- but its commits page does filter by path and date, so
+   * a release plus the date it shipped is exactly "what changed here since then". */
+  _historyUrl(path, ref = "dev", since = "") {
+    const base = "https://github.com/home-assistant/core/commits";
+    const encoded = path.split("/").map(encodeURIComponent).join("/");
+    const query = since ? `?since=${encodeURIComponent(since)}` : "";
+    return `${base}/${encodeURIComponent(ref)}/${encoded}${query}`;
+  }
+
+  _historyLink(path, text, ref = "dev", since = "") {
+    return `<a href="${this._historyUrl(path, ref, since)}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`;
+  }
+
   _domainLinksHtml() {
     const info = this._domainInfo;
     if (!info) return "";
-    const base = "https://github.com/home-assistant/core/commits";
-    const path = `homeassistant/components/${encodeURIComponent(info.domain)}`;
-    const link = (ref, text) =>
-      `<a href="${base}/${encodeURIComponent(ref)}/${path}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`;
-    const version = this.shadowRoot.querySelector("#add-form")?.version?.value;
-    return `<span class="muted">history:</span> ${link("dev", "latest")}${
-      version ? ` · ${link(version, `at ${version}`)}` : ""
-    }`;
+    const path = `homeassistant/components/${info.domain}`;
+    const version =
+      this._source === "git" ? "" : this.shadowRoot.querySelector("#add-form")?.version?.value || "";
+    const since = version ? this._released[version] || "" : "";
+    const links = [this._historyLink(path, "latest")];
+    if (since) links.push(this._historyLink(path, `changed since ${version}`, "dev", since));
+    if (version) links.push(this._historyLink(path, `at ${version}`, version));
+    return `<span class="muted">history:</span> ${links.join(" · ")}`;
   }
 
   _onInput(ev) {
@@ -883,8 +906,8 @@ class IntegrationPinsPanel extends HTMLElement {
         border-bottom-color: var(--error-color, #db4437); }
       #form-messages { display: flex; flex-direction: column; gap: 10px; }
       #form-messages:empty { display: none; }
-      #domain-links a { color: var(--primary-color); text-decoration: none; }
-      #domain-links a:hover { text-decoration: underline; }
+      #domain-links a, #form-messages a { color: var(--primary-color); text-decoration: none; }
+      #domain-links a:hover, #form-messages a:hover { text-decoration: underline; }
       .warn-box { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 8px;
         background: rgba(255,152,0,.12); border: 1px solid rgba(255,152,0,.4); font-size: 0.92em; }
       .warn-box ha-icon { color: var(--warning-color, #ff9800); flex: none; }
