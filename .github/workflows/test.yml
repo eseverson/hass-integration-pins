@@ -19,17 +19,18 @@ jobs:
     name: pytest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
+          cache-dependency-path: tests/requirements.txt
 
       - name: Install Home Assistant and the test harness
         run: |
           python -m pip install --upgrade pip
-          pip install homeassistant pytest-homeassistant-custom-component
+          pip install -r tests/requirements.txt
           # The frontend package is not a dependency of homeassistant, but the panel
           # tests need the exact build the installed core asks for.
           FRONTEND=$(python -c "import json,os,homeassistant.components.frontend as f;print(json.load(open(os.path.join(os.path.dirname(f.__file__),'manifest.json')))['requirements'][0])")

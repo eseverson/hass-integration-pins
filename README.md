@@ -65,7 +65,8 @@ Home Assistant logs a "custom integration ... has not been tested" warning for e
 
 ```
 uv venv --python 3.13 .venv && . .venv/bin/activate
-uv pip install homeassistant pytest-homeassistant-custom-component "home-assistant-frontend==<version from homeassistant/components/frontend/manifest.json>"
+uv pip install -r tests/requirements.txt
+uv pip install "home-assistant-frontend==<version from homeassistant/components/frontend/manifest.json>"
 pytest
 ```
 
