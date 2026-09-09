@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # This integration reads Home Assistant internals that core is free to change,
+    # so a nightly run says when a new release has broken it.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install Home Assistant and the test harness
+        run: |
+          python -m pip install --upgrade pip
+          pip install homeassistant pytest-homeassistant-custom-component
+          # The frontend package is not a dependency of homeassistant, but the panel
+          # tests need the exact build the installed core asks for.
+          FRONTEND=$(python -c "import json,os,homeassistant.components.frontend as f;print(json.load(open(os.path.join(os.path.dirname(f.__file__),'manifest.json')))['requirements'][0])")
+          pip install "$FRONTEND"
+
+      - name: Run the test suite
+        run: pytest -q

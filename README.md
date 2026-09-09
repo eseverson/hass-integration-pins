@@ -1,5 +1,11 @@
 # Integration Pins for Home Assistant
 
+[![Release](https://img.shields.io/github/v/release/eseverson/hass-integration-pins?style=flat-square)](https://github.com/eseverson/hass-integration-pins/releases)
+[![License](https://img.shields.io/github/license/eseverson/hass-integration-pins?style=flat-square)](LICENSE)
+[![HACS](https://img.shields.io/badge/HACS-Custom-orange.svg?style=flat-square)](https://hacs.xyz)
+[![Validate](https://img.shields.io/github/actions/workflow/status/eseverson/hass-integration-pins/validate.yml?branch=main&label=validate&style=flat-square)](https://github.com/eseverson/hass-integration-pins/actions/workflows/validate.yml)
+[![Tests](https://img.shields.io/github/actions/workflow/status/eseverson/hass-integration-pins/test.yml?branch=main&label=tests&style=flat-square)](https://github.com/eseverson/hass-integration-pins/actions/workflows/test.yml)
+
 Run one core integration's code from a different Home Assistant release, without downgrading the rest.
 
 > **Integration Pins is not affiliated with, endorsed, recommended, or supported by the Home Assistant project.**
@@ -14,9 +20,12 @@ Nothing changes automatically on upgrade. Each pin carries a "valid for core" ra
 
 ## Install
 
-1. Copy `custom_components/integration_pins/` into your config directory.
-2. Restart Home Assistant.
-3. Settings → Devices & services → Add integration → **Integration Pins**.
+Through HACS, add this repository as a custom repository with category **Integration**, then install it. Or copy `custom_components/integration_pins/` into your config directory yourself.
+
+Either way:
+
+1. Restart Home Assistant.
+2. Settings → Devices & services → Add integration → **Integration Pins**.
 
 The panel appears in the sidebar for admin users. It needs outbound HTTPS to `pypi.org` and `files.pythonhosted.org`, plus `api.github.com` and `raw.githubusercontent.com` if you pin from git.
 
@@ -74,3 +83,7 @@ custom_components/integration_pins/
 Editing the panel needs only a browser reload; Python needs a restart, which can leave the panel newer than its backend. The backend advertises what it understands in `const.FEATURES` and the panel hides anything the running one does not list — add a name there whenever the panel starts depending on something the previous version could not do.
 
 Tests drive the pin → pending → out-of-range → unpin flow through the websocket API against a real Home Assistant core, with PyPI and GitHub served from an aiohttp mock.
+
+## License
+
+[MIT](LICENSE).
