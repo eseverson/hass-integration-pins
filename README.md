@@ -26,7 +26,7 @@ The panel appears in the sidebar for admin users. It needs outbound HTTPS to `py
 
 **Take the code from git** instead to pick up a fix that has merged but not shipped — enter a branch, tag or commit. Two caveats, which the panel also states: the repository carries English translations only, and `dev` is written against the *next* core release, so it can call helpers your core does not have yet.
 
-**Compare with running code** says which files differ from what you are running, or that a release is identical to it and pinning would change nothing. The domain field links the integration's upstream history, where **changed since &lt;release&gt;** is the commits between that release and now; each changed file links to the commits that touched it.
+**Compare with running code** says which files differ from what you are running, or that a release is identical to it and pinning would change nothing. Pin runs it for you if you have not: the first press shows what the change would do, the second commits it. The domain field links the integration's upstream history, where **changed since &lt;release&gt;** is the commits between that release and now; each changed file links to the commits that touched it.
 
 When other integrations are built on the one you picked, the form says how many depend on it and which of those are loaded here.
 

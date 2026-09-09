@@ -58,6 +58,8 @@ class IntegrationPinsPanel extends HTMLElement {
     this._errorCode = null; // websocket error code of the last failed call
     this._migrationBlocked = false; // the pin cannot read this instance's stored config entry
     this._ackMigration = false;
+    this._comparedKey = null; // what the visible comparison was actually run against
+    this._pinNeedsConfirm = false;
     this._versions = [];
     this._released = {}; // version -> YYYY-MM-DD it shipped, for "changed since" links
     this._prereleases = false;
@@ -178,9 +180,22 @@ class IntegrationPinsPanel extends HTMLElement {
         };
   }
 
+  _candidateKey(chosen) {
+    return `${this._source}|${chosen.domain}|${chosen.label}`;
+  }
+
   async _pin(form) {
     const chosen = this._formSource(form);
     if (!chosen) return;
+    /* Pinning is the point at which a config entry can be rewritten or made unreadable,
+     * so the first press runs the comparison and shows what it found; the second commits.
+     * Changing the domain or the release invalidates that and asks again. */
+    if (this._comparedKey !== this._candidateKey(chosen)) {
+      await this._runCompare();
+      this._pinNeedsConfirm = Boolean(this._compare);
+      this._render();
+      return;
+    }
     const r = await this._call(
       {
         type: "integration_pins/pin",
@@ -214,6 +229,8 @@ class IntegrationPinsPanel extends HTMLElement {
     this._fieldErrors = {};
     this._migrationBlocked = false;
     this._ackMigration = false;
+    this._comparedKey = null;
+    this._pinNeedsConfirm = false;
     this._resetting = true;
     this._render();
   }
@@ -238,8 +255,19 @@ class IntegrationPinsPanel extends HTMLElement {
       `Reading the file list for ${chosen.label}…`
     );
     this._compare = r;
+    this._comparedKey = r ? this._candidateKey(chosen) : null;
     if (r) this._migrationBlocked = r.migration?.verdict === "blocked";
     this._render();
+  }
+
+  _confirmHtml() {
+    if (!this._pinNeedsConfirm || !this._compare) return "";
+    return `
+      <div class="info-box">
+        <ha-icon icon="mdi:gesture-tap-button"></ha-icon>
+        <div>That is what pinning ${esc(this._compare.domain)} to ${esc(this._compare.version)} would
+        change. Press <strong>Pin</strong> again to go ahead.</div>
+      </div>`;
   }
 
   _compareHtml() {
@@ -391,6 +419,7 @@ class IntegrationPinsPanel extends HTMLElement {
         this._domainWarningHtml(),
         this._migrationHtml(),
         this._compareHtml(),
+        this._confirmHtml(),
       ]
         .filter(Boolean)
         .join("");
@@ -440,10 +469,16 @@ class IntegrationPinsPanel extends HTMLElement {
       : "";
     if (!lines && !uid) return "";
     const severe = ["blocked", "downgrade", "forward"].includes(m.verdict);
+    const ack = m.verdict === "blocked"
+      ? `<label class="ack">
+           <input type="checkbox" name="acknowledge_migration" ${this._ackMigration ? "checked" : ""}>
+           <span>Pin it anyway, knowing it may not load</span>
+         </label>`
+      : "";
     return `
       <div class="${severe ? "warn-box" : "info-box"}">
         <ha-icon icon="${severe ? "mdi:database-alert" : "mdi:database-sync"}"></ha-icon>
-        <div>${lines ? `<div>${lines}</div>` : ""}${uid}</div>
+        <div>${lines ? `<div>${lines}</div>` : ""}${uid}${ack}</div>
       </div>`;
   }
 
@@ -492,6 +527,8 @@ class IntegrationPinsPanel extends HTMLElement {
   _onInput(ev) {
     if (ev.target.name === "git_ref") {
       this._gitRef = ev.target.value;
+      this._comparedKey = null;
+      this._pinNeedsConfirm = false;
       this._clearFieldError("git_ref");
       return;
     }
@@ -501,6 +538,8 @@ class IntegrationPinsPanel extends HTMLElement {
       this._compare = null;
       this._migrationBlocked = false;
       this._ackMigration = false;
+      this._comparedKey = null;
+      this._pinNeedsConfirm = false;
     }
     if (this._domainInfo && this._domainInfo.domain !== domain) {
       this._domainInfo = null;
@@ -584,6 +623,8 @@ class IntegrationPinsPanel extends HTMLElement {
         this._compare = null;
         this._migrationBlocked = false;
         this._ackMigration = false;
+        this._comparedKey = null;
+        this._pinNeedsConfirm = false;
         this._fieldErrors = {};
         return this._render();
       }
@@ -618,6 +659,8 @@ class IntegrationPinsPanel extends HTMLElement {
       if (this._compare) this._compare = null;
       this._migrationBlocked = false;
       this._ackMigration = false;
+      this._comparedKey = null;
+      this._pinNeedsConfirm = false;
       this._clearFieldError("version");
       this._paintDomainAids();
     }
@@ -823,11 +866,6 @@ class IntegrationPinsPanel extends HTMLElement {
             <div class="form-actions">
               <ha-button type="submit" raised ${this._busy ? "disabled" : ""}>Pin</ha-button>
               <ha-button data-action="compare" ${this._busy ? "disabled" : ""}>Compare with running code</ha-button>
-              ${this._migrationBlocked ? `
-                <label class="ack small">
-                  <input type="checkbox" name="acknowledge_migration" ${this._ackMigration ? "checked" : ""}>
-                  pin it anyway, knowing it may not load
-                </label>` : ""}
             </div>
             <div id="form-messages" class="span-all"></div>
           </form>
@@ -1015,7 +1053,9 @@ class IntegrationPinsPanel extends HTMLElement {
       .inline-form .muted, .form-actions, .span-all { grid-column: 1 / -1; }
       .span-all:empty { display: none; }
       .form-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-      .ack { display: flex; align-items: center; gap: 6px; color: var(--error-color, #db4437); }
+      .ack { display: flex; flex-direction: row; align-items: center; gap: 8px; margin-top: 8px;
+        font-weight: 500; color: var(--error-color, #db4437); cursor: pointer; }
+      .ack input { flex: none; margin: 0; }
       ha-button.danger { --mdc-theme-primary: var(--error-color); }
       @media (max-width: 800px) {
         .table, .table.cols-3 { grid-template-columns: 1fr 1fr; }
