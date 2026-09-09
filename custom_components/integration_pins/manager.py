@@ -18,6 +18,8 @@ from . import pinner
 from .const import (
     DOMAIN,
     MARKER_FILE,
+    SOURCE_GIT,
+    SOURCE_PYPI,
     ISSUE_FOREIGN,
     ISSUE_MISSING,
     ISSUE_OUT_OF_RANGE,
@@ -140,24 +142,37 @@ class PinManager:
             "loaded_dependents": [d for d in dependents if d in in_use],
         }
 
-    async def async_compare(self, domain: str, version: str) -> dict[str, Any]:
-        """Which files of an integration differ between a release and the running code."""
+    async def async_compare(
+        self, domain: str, version: str = "", git_ref: str = ""
+    ) -> dict[str, Any]:
+        """Which files of an integration differ between a candidate and the running code."""
         domain = domain.strip().lower()
         version = version.strip()
-        pinner.parse_version(version)
+        git_ref = git_ref.strip()
+        if bool(version) == bool(git_ref):
+            raise PinError("Compare against either a release or a git ref, not both")
         session = async_get_clientsession(self.hass)
 
-        wheel = await pinner.async_get_wheel(session, version)
-        candidate = await pinner.async_component_entries(session, wheel, domain)
-        if not candidate:
-            raise PinError(f"Home Assistant {version} has no core integration '{domain}'")
+        if git_ref:
+            source = await pinner.async_resolve_git_source(session, git_ref)
+            candidate = pinner.digest_files(
+                await pinner.async_git_component(session, source, domain)
+            )
+            label = f"{source.ref} @ {source.sha[:7]}"
+        else:
+            pinner.parse_version(version)
+            wheel = await pinner.async_get_wheel(session, version)
+            candidate = await pinner.async_component_entries(session, wheel, domain)
+            if not candidate:
+                raise PinError(f"Home Assistant {version} has no core integration '{domain}'")
+            label = version
 
         base, compared_with = await self._async_baseline(domain, session)
         result = pinner.compare_digests(base, candidate)
         return {
             **result,
             "domain": domain,
-            "version": version,
+            "version": label,
             "compared_with": compared_with,
             "identical": not (result["added"] or result["removed"] or result["changed"]),
         }
@@ -171,18 +186,22 @@ class PinManager:
         pin = self.store.get(domain)
         marker = info.get("marker") or {}
 
-        if (
+        managed = (
             info.get("present")
             and pin is not None
-            and pin.source == "pypi"
             and marker.get("pinned_version") == pin.pinned_version
-        ):
-            # The override on disk was extracted from a release, but pinning rewrote its
-            # manifest and added a marker; that release's own wheel is the honest baseline.
+        )
+        # An override we wrote is not byte-identical to its source -- pinning rewrites the
+        # manifest and adds a marker -- so the honest baseline is the source it came from.
+        if managed and pin.source == SOURCE_PYPI:
             base_wheel = await pinner.async_get_wheel(session, pin.pinned_version)
             entries = await pinner.async_component_entries(session, base_wheel, domain)
             if entries:
                 return entries, f"pinned {pin.pinned_version}"
+        if managed and pin.source == SOURCE_GIT and pin.git_sha:
+            source = pinner.GitSource(pin.git_ref, pin.git_sha, pin.core_at_pin)
+            files = await pinner.async_git_component(session, source, domain)
+            return pinner.digest_files(files), f"pinned {pin.pinned_version}"
 
         if info.get("present"):
             path = pinner.custom_components_dir(config_dir) / domain
@@ -221,10 +240,19 @@ class PinManager:
 
     # -- writes --------------------------------------------------------------
 
-    async def async_pin(self, domain: str, version: str, core_range: str, reason: str) -> Pin:
+    async def async_pin(
+        self,
+        domain: str,
+        version: str = "",
+        core_range: str = "",
+        reason: str = "",
+        git_ref: str = "",
+    ) -> Pin:
         domain = domain.strip().lower()
         version = version.strip()
-        pinner.parse_version(version)
+        git_ref = git_ref.strip()
+        if bool(version) == bool(git_ref):
+            raise PinError("Take the code from either a release or a git ref, not both")
         pinner.parse_range(core_range)
         if domain == DOMAIN:
             raise PinError("Refusing to pin integration_pins itself")
@@ -237,36 +265,73 @@ class PinManager:
                 )
             existing = self.store.get(domain)
             session = async_get_clientsession(self.hass)
-            wheel = await pinner.async_get_wheel(session, version)
-            _LOGGER.info(
-                "Pinning %s to Home Assistant %s (%.1f MB wheel)",
-                domain,
-                version,
-                wheel.size / 1e6,
-            )
-            with tempfile.TemporaryDirectory(prefix="integration_pins.") as tmp:
-                wheel_path = Path(tmp) / f"homeassistant-{version}.whl"
-                await pinner.async_download(session, wheel, wheel_path)
-                await self.hass.async_add_executor_job(
-                    pinner.extract_component,
-                    wheel_path,
-                    domain,
-                    version,
-                    self.hass.config.config_dir,
-                    CORE_VERSION,
+            if git_ref:
+                pinned_version, provenance = await self._async_install_from_git(
+                    domain, git_ref, session
+                )
+            else:
+                pinned_version, provenance = await self._async_install_from_release(
+                    domain, version, session
                 )
             pin = Pin(
                 domain=domain,
-                pinned_version=version,
+                pinned_version=pinned_version,
                 core_range=core_range.strip(),
                 reason=reason.strip(),
                 core_at_pin=CORE_VERSION,
-                source="pypi",
+                source=SOURCE_GIT if git_ref else SOURCE_PYPI,
                 created=existing.created if existing else Pin.__dataclass_fields__["created"].default_factory(),
+                **provenance,
             )
             await self.store.async_set(pin)
         await self.async_check()
         return pin
+
+    async def _async_install_from_release(
+        self, domain: str, version: str, session: Any
+    ) -> tuple[str, dict[str, str]]:
+        pinner.parse_version(version)
+        wheel = await pinner.async_get_wheel(session, version)
+        _LOGGER.info(
+            "Pinning %s to Home Assistant %s (%.1f MB wheel)", domain, version, wheel.size / 1e6
+        )
+        with tempfile.TemporaryDirectory(prefix="integration_pins.") as tmp:
+            wheel_path = Path(tmp) / f"homeassistant-{version}.whl"
+            await pinner.async_download(session, wheel, wheel_path)
+            await self.hass.async_add_executor_job(
+                pinner.extract_component,
+                wheel_path,
+                domain,
+                version,
+                self.hass.config.config_dir,
+                CORE_VERSION,
+            )
+        return version, {}
+
+    async def _async_install_from_git(
+        self, domain: str, git_ref: str, session: Any
+    ) -> tuple[str, dict[str, str]]:
+        source = await pinner.async_resolve_git_source(session, git_ref)
+        files = await pinner.async_git_component(session, source, domain)
+        _LOGGER.info(
+            "Pinning %s to %s @ %s (%d files, targets core %s)",
+            domain,
+            source.ref,
+            source.sha[:7],
+            len(files),
+            source.core_version,
+        )
+        provenance = {"git_ref": source.ref, "git_sha": source.sha}
+        await self.hass.async_add_executor_job(
+            pinner.install_component,
+            files,
+            domain,
+            source.version,
+            self.hass.config.config_dir,
+            CORE_VERSION,
+            provenance,
+        )
+        return source.version, provenance
 
     async def async_adopt(
         self, domain: str, pinned_version: str, core_range: str, reason: str
@@ -315,7 +380,7 @@ class PinManager:
             if not keep_files:
                 # A pypi pin records the release it came from, so the files can always be
                 # fetched again; an adopted one was placed by hand and exists nowhere else.
-                keep_a_copy = pin.source != "pypi"
+                keep_a_copy = pin.source not in (SOURCE_PYPI, SOURCE_GIT)
                 retired = await self.hass.async_add_executor_job(
                     pinner.remove_override,
                     domain,

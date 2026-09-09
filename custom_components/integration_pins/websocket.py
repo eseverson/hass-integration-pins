@@ -124,7 +124,8 @@ async def ws_versions(hass, connection, msg: dict[str, Any]) -> None:
     {
         vol.Required("type"): f"{DOMAIN}/pin",
         vol.Required("domain"): str,
-        vol.Required("version"): str,
+        vol.Optional("version", default=""): str,
+        vol.Optional("git_ref", default=""): str,
         vol.Optional("core_range", default=""): str,
         vol.Optional("reason", default=""): str,
     }
@@ -133,7 +134,7 @@ async def ws_versions(hass, connection, msg: dict[str, Any]) -> None:
 @_wrap
 async def ws_pin(hass, connection, msg: dict[str, Any]) -> None:
     pin = await _manager(hass).async_pin(
-        msg["domain"], msg["version"], msg["core_range"], msg["reason"]
+        msg["domain"], msg["version"], msg["core_range"], msg["reason"], msg["git_ref"]
     )
     connection.send_result(msg["id"], pin.as_dict())
 
@@ -224,12 +225,14 @@ async def ws_clear_retired(hass, connection, msg: dict[str, Any]) -> None:
     {
         vol.Required("type"): f"{DOMAIN}/compare",
         vol.Required("domain"): str,
-        vol.Required("version"): str,
+        vol.Optional("version", default=""): str,
+        vol.Optional("git_ref", default=""): str,
     }
 )
 @websocket_api.async_response
 @_wrap
 async def ws_compare(hass, connection, msg: dict[str, Any]) -> None:
     connection.send_result(
-        msg["id"], await _manager(hass).async_compare(msg["domain"], msg["version"])
+        msg["id"],
+        await _manager(hass).async_compare(msg["domain"], msg["version"], msg["git_ref"]),
     )

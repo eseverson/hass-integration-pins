@@ -20,6 +20,15 @@ MARKER_FILE = ".integration_pin.json"
 # Where unpinned override directories are moved (relative to the config dir).
 RETIRED_DIRNAME = "integration_pins_retired"
 
+# Where a pin's code came from.
+SOURCE_PYPI = "pypi"  # extracted from a release wheel
+SOURCE_GIT = "git"  # fetched from a commit in the core repository
+SOURCE_ADOPTED = "adopted"  # a directory that was already there
+
+GITHUB_REPO = "home-assistant/core"
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
+GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}"
+
 PYPI_PROJECT = "homeassistant"
 PYPI_JSON_URL = f"https://pypi.org/pypi/{PYPI_PROJECT}/json"
 PYPI_VERSION_URL = f"https://pypi.org/pypi/{PYPI_PROJECT}/{{version}}/json"

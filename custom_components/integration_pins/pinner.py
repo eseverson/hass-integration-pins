@@ -6,10 +6,12 @@ executor. Network access goes through Home Assistant's shared aiohttp session.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import struct
 import tempfile
@@ -25,7 +27,14 @@ from packaging.version import InvalidVersion, Version
 
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import MARKER_FILE, PYPI_JSON_URL, PYPI_VERSION_URL, RETIRED_DIRNAME
+from .const import (
+    GITHUB_API_URL,
+    GITHUB_RAW_URL,
+    MARKER_FILE,
+    PYPI_JSON_URL,
+    PYPI_VERSION_URL,
+    RETIRED_DIRNAME,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -134,6 +143,118 @@ async def async_download(session: aiohttp.ClientSession, wheel: WheelInfo, dest:
 
 
 # ---------------------------------------------------------------------------
+# GitHub
+#
+# The repository is not the release: HA generates the non-English translations at
+# build time, so a git pin ships English only. In exchange it is far cheaper than a
+# wheel -- two API calls for the commit and the integration's file list, then the
+# files themselves from raw.githubusercontent.com, which is not rate limited.
+# ---------------------------------------------------------------------------
+
+_VERSION_PARTS = ("MAJOR", "MINOR", "PATCH")
+_MAX_CONCURRENT_BLOBS = 8
+
+
+@dataclass
+class GitSource:
+    """A resolved point in the core repository."""
+
+    ref: str  # what was asked for: a branch, a tag or a commit
+    sha: str  # the commit it resolved to
+    core_version: str  # the core version that commit builds
+
+    @property
+    def version(self) -> str:
+        """Manifest version for code taken from this commit."""
+        return f"{self.core_version}+{self.sha[:7]}"
+
+
+async def _github_json(session: aiohttp.ClientSession, url: str, missing: str, **kwargs) -> Any:
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30), **kwargs) as resp:
+        if resp.status == 404:
+            raise PinError(missing)
+        if resp.status in (403, 429):
+            raise PinError(
+                "GitHub is rate limiting this instance (60 requests an hour without a "
+                "token). Try again later."
+            )
+        if resp.status != 200:
+            raise PinError(f"GitHub returned HTTP {resp.status} for {url}")
+        return await resp.json()
+
+
+def _parse_core_version(const_py: str) -> str:
+    """Read __version__ out of homeassistant/const.py without executing it."""
+    parts = []
+    for name in _VERSION_PARTS:
+        match = re.search(rf"^{name}_VERSION: Final = (.+)$", const_py, re.MULTILINE)
+        if match is None:
+            raise PinError("Could not read the core version at that commit")
+        parts.append(match.group(1).strip().strip('"').strip("'"))
+    return ".".join(parts)
+
+
+async def async_resolve_git_source(session: aiohttp.ClientSession, ref: str) -> GitSource:
+    """Pin a branch, tag or commit down to one immutable commit."""
+    ref = ref.strip()
+    if not ref:
+        raise PinError("Enter a branch, tag or commit to take the code from")
+
+    data = await _github_json(
+        session,
+        f"{GITHUB_API_URL}/commits/{ref}",
+        f"'{ref}' is not a branch, tag or commit in home-assistant/core",
+    )
+    sha = data.get("sha")
+    if not sha:
+        raise PinError(f"GitHub returned no commit for '{ref}'")
+
+    async with session.get(
+        f"{GITHUB_RAW_URL}/{sha}/homeassistant/const.py",
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as resp:
+        if resp.status != 200:
+            raise PinError(f"Could not read the core version at {sha[:7]}")
+        const_py = await resp.text()
+
+    return GitSource(ref=ref, sha=sha, core_version=_parse_core_version(const_py))
+
+
+async def async_git_component(
+    session: aiohttp.ClientSession, source: GitSource, domain: str
+) -> dict[str, bytes]:
+    """Every file of homeassistant/components/<domain>/ at a commit, keyed by path."""
+    data = await _github_json(
+        session,
+        f"{GITHUB_API_URL}/git/trees/{source.sha}:homeassistant/components/{domain}",
+        f"Home Assistant at {source.ref} has no core integration '{domain}'",
+        params={"recursive": "1"},
+    )
+    if data.get("truncated"):
+        raise PinError(f"'{domain}' is too large for GitHub to list in one request")
+
+    paths = [
+        entry["path"]
+        for entry in data.get("tree", [])
+        if entry.get("type") == "blob" and "__pycache__/" not in entry.get("path", "")
+    ]
+    if not paths:
+        raise PinError(f"Home Assistant at {source.ref} has no core integration '{domain}'")
+
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_BLOBS)
+
+    async def fetch(path: str) -> tuple[str, bytes]:
+        url = f"{GITHUB_RAW_URL}/{source.sha}/homeassistant/components/{domain}/{path}"
+        async with semaphore:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status != 200:
+                    raise PinError(f"Could not fetch {path} at {source.sha[:7]}")
+                return path, await resp.read()
+
+    return dict(await asyncio.gather(*(fetch(path) for path in paths)))
+
+
+# ---------------------------------------------------------------------------
 # Comparing a release against the running code
 #
 # A wheel is a zip, and a zip's central directory carries the CRC32 and size of
@@ -220,6 +341,11 @@ async def async_component_entries(
         for name, value in parse_central_directory(directory).items()
         if name.startswith(prefix) and not name.endswith("/") and "__pycache__/" not in name
     }
+
+
+def digest_files(files: dict[str, bytes]) -> dict[str, tuple[int, int]]:
+    """Same digest shape as a wheel's central directory, for files already in hand."""
+    return {rel: (zlib.crc32(data), len(data)) for rel, data in files.items()}
 
 
 def local_component_digest(path: Path, ignore: set[str] | None = None) -> dict[str, tuple[int, int]]:
@@ -342,20 +468,71 @@ def core_requirements(domain: str) -> list[str]:
     return list(manifest.get("requirements", [])) if manifest else []
 
 
-def extract_component(
-    wheel_path: Path, domain: str, version: str, config_dir: str, core_version: str
-) -> Path:
-    """Extract homeassistant/components/<domain>/ from a wheel into custom_components.
+def _write_into(staging: Path, rel: str, data: bytes) -> None:
+    out = staging / rel
+    if not out.resolve().is_relative_to(staging.resolve()):
+        raise PinError("Refusing to write a path outside the target directory")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
 
-    Writes to a temporary sibling directory first and swaps it in atomically-ish so a
-    failed extraction never leaves a half-written override behind.
+
+def _finalize(
+    staging: Path, domain: str, version: str, core_version: str, marker_extra: dict[str, Any] | None
+) -> None:
+    manifest_path = staging / "manifest.json"
+    if not manifest_path.is_file():
+        raise PinError(f"No manifest.json in the '{domain}' code that was fetched")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # Custom integrations must declare a version; core manifests don't.
+    manifest["version"] = version
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    write_marker(staging, domain, version, core_version, marker_extra)
+
+
+def _atomic_install(domain: str, config_dir: str, populate) -> Path:
+    """Build the override in a sibling directory and swap it in.
+
+    A failed fetch or a bad path must never leave a half-written override behind.
     """
-    prefix = f"homeassistant/components/{domain}/"
     target = custom_components_dir(config_dir) / domain
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{domain}.", dir=target.parent))
-
     try:
+        populate(staging)
+        if target.exists():
+            _retire(target, config_dir, f"{domain}-replaced")
+        os.replace(staging, target)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return target
+
+
+def install_component(
+    files: dict[str, bytes],
+    domain: str,
+    version: str,
+    config_dir: str,
+    core_version: str,
+    marker_extra: dict[str, Any] | None = None,
+) -> Path:
+    """Install already-fetched files as custom_components/<domain>."""
+
+    def populate(staging: Path) -> None:
+        for rel, data in files.items():
+            _write_into(staging, rel, data)
+        _finalize(staging, domain, version, core_version, marker_extra)
+
+    return _atomic_install(domain, config_dir, populate)
+
+
+def extract_component(
+    wheel_path: Path, domain: str, version: str, config_dir: str, core_version: str
+) -> Path:
+    """Extract homeassistant/components/<domain>/ from a wheel into custom_components."""
+    prefix = f"homeassistant/components/{domain}/"
+
+    def populate(staging: Path) -> None:
         with zipfile.ZipFile(wheel_path) as zf:
             members = [m for m in zf.namelist() if m.startswith(prefix) and not m.endswith("/")]
             if not members:
@@ -366,29 +543,22 @@ def extract_component(
                     continue
                 out = staging / rel
                 if not out.resolve().is_relative_to(staging.resolve()):
-                    raise PinError("Refusing to extract path outside target directory")
+                    raise PinError("Refusing to write a path outside the target directory")
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(member) as src, out.open("wb") as dst:
                     shutil.copyfileobj(src, dst)
+        _finalize(staging, domain, version, core_version, None)
 
-        manifest_path = staging / "manifest.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        # Custom integrations must declare a version; core manifests don't.
-        manifest["version"] = version
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-
-        write_marker(staging, domain, version, core_version)
-
-        if target.exists():
-            _retire(target, config_dir, f"{domain}-replaced")
-        os.replace(staging, target)
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    return target
+    return _atomic_install(domain, config_dir, populate)
 
 
-def write_marker(path: Path, domain: str, version: str, core_version: str) -> None:
+def write_marker(
+    path: Path,
+    domain: str,
+    version: str,
+    core_version: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
     from homeassistant.util import dt as dt_util
 
     (path / MARKER_FILE).write_text(
@@ -399,6 +569,7 @@ def write_marker(path: Path, domain: str, version: str, core_version: str) -> No
                 "core_at_pin": core_version,
                 "created": dt_util.utcnow().isoformat(),
                 "managed_by": "integration_pins",
+                **(extra or {}),
             },
             indent=2,
         )
@@ -501,14 +672,27 @@ def inspect_override(domain: str, config_dir: str) -> dict[str, Any]:
     }
 
 
+_HACS_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
+
+
 def _hacs_sources(config_dir: str) -> dict[str, str]:
     """Map domain -> HACS repository, read from HACS's own storage.
 
     Best effort: this is HACS's private file and its shape has changed between major
     versions, so walk it for anything that looks like a repository record instead of
-    assuming a layout, and return nothing at all if it cannot be read.
+    assuming a layout, and return nothing at all if it cannot be read. Parsed results
+    are kept until the file's mtime moves, since a snapshot consults this twice and
+    the file grows with the number of repositories installed.
     """
     path = Path(config_dir) / ".storage" / "hacs.data"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    cached = _HACS_CACHE.get(str(path))
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -531,7 +715,13 @@ def _hacs_sources(config_dir: str) -> dict[str, str]:
             walk(value)
 
     walk(data)
+    _HACS_CACHE[str(path)] = (mtime, sources)
     return sources
+
+
+def _source_of(domain: str, hacs: dict[str, str]) -> dict[str, str]:
+    repo = hacs.get(domain)
+    return {"source": "hacs" if repo else "manual", "source_detail": repo or ""}
 
 
 def list_custom_integrations(config_dir: str, exclude: set[str]) -> list[dict[str, Any]]:
@@ -548,13 +738,11 @@ def list_custom_integrations(config_dir: str, exclude: set[str]) -> list[dict[st
         manifest = read_manifest(path)
         if manifest is None:
             continue
-        repo = hacs.get(path.name)
         result.append(
             {
                 "domain": path.name,
                 "version": manifest.get("version"),
-                "source": "hacs" if repo else "manual",
-                "source_detail": repo or "",
+                **_source_of(path.name, hacs),
             }
         )
     return result
@@ -566,6 +754,7 @@ def list_unmanaged_overrides(config_dir: str, managed: set[str]) -> list[dict[st
     if not ccdir.is_dir():
         return []
     core = set(list_core_domains())
+    hacs = _hacs_sources(config_dir)
     result: list[dict[str, Any]] = []
     for path in sorted(ccdir.iterdir()):
         if not path.is_dir() or path.name in managed or path.name not in core:
@@ -578,6 +767,7 @@ def list_unmanaged_overrides(config_dir: str, managed: set[str]) -> list[dict[st
                 "domain": path.name,
                 "manifest_version": manifest.get("version"),
                 "marker": read_marker(path),
+                **_source_of(path.name, hacs),
             }
         )
     return result

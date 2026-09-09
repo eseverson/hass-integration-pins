@@ -44,6 +44,9 @@ class IntegrationPinsPanel extends HTMLElement {
     this._domainInfo = null; // dependency info for the domain currently typed in
     this._domainInfoTimer = null;
     this._compare = null; // result of the last "Compare" against the running code
+    this._source = "release"; // "release" (a PyPI wheel) or "git" (a commit in core)
+    this._gitRef = "dev";
+    this._fieldErrors = {}; // field name -> message, shown against the input itself
     this._versions = [];
     this._prereleases = false;
     this._busy = null; // text shown while a long operation runs
@@ -132,22 +135,48 @@ class IntegrationPinsPanel extends HTMLElement {
 
   // ---- actions -----------------------------------------------------------
 
-  async _pin(form) {
-    const domain = form.domain.value.trim();
-    const version = form.version.value.trim();
-    const core_range = form.core_range.value.trim();
-    const reason = form.reason.value.trim();
-    if (!domain || !version) {
-      this._error = "Domain and version are required.";
-      this._render();
-      return;
+  /* Which source is selected, and what the form says about it. Returns null and marks
+   * the offending field when something is missing, so the message lands on the input
+   * rather than in a banner at the top of the page. */
+  _formSource(form) {
+    const git = this._source === "git";
+    const domain = (form?.domain?.value || "").trim().toLowerCase();
+    const ref = (form?.git_ref?.value || "").trim();
+    const version = (form?.version?.value || "").trim();
+    this._fieldErrors = {};
+    if (!domain) this._fieldErrors.domain = "Pick an integration first";
+    if (git && !ref) this._fieldErrors.git_ref = "Enter a branch, tag or commit";
+    if (!git && !version) this._fieldErrors.version = "Pick a release first";
+    if (Object.keys(this._fieldErrors).length) {
+      this._paintFieldErrors();
+      return null;
     }
+    return git
+      ? { domain, payload: { git_ref: ref }, label: `${ref}`, busy: `Fetching ${domain} from ${ref}…` }
+      : {
+          domain,
+          payload: { version },
+          label: version,
+          busy: `Downloading Home Assistant ${version} and extracting ${domain}… this can take a minute.`,
+        };
+  }
+
+  async _pin(form) {
+    const chosen = this._formSource(form);
+    if (!chosen) return;
     const r = await this._call(
-      { type: "integration_pins/pin", domain, version, core_range, reason },
-      `Downloading Home Assistant ${version} and extracting ${domain}… this can take a minute.`
+      {
+        type: "integration_pins/pin",
+        domain: chosen.domain,
+        ...chosen.payload,
+        core_range: form.core_range.value.trim(),
+        reason: form.reason.value.trim(),
+      },
+      chosen.busy
     );
     if (r) {
-      this._notice = `Pinned ${domain} to ${version}. Restart Home Assistant to load it.`;
+      this._notice = `Pinned ${chosen.domain} to ${r.pinned_version}. Restart Home Assistant to load it.`;
+      this._compare = null;
       form.reset();
       this._render();
     }
@@ -155,8 +184,8 @@ class IntegrationPinsPanel extends HTMLElement {
 
   async _unpin(domain) {
     const pin = this._snapshot?.pins.find((p) => p.domain === domain);
-    const fate = pin && pin.source === "pypi"
-      ? `custom_components/${domain}/ is deleted; it came from a release on PyPI, so re-pinning fetches it again.`
+    const fate = pin && (pin.source === "pypi" || pin.source === "git")
+      ? `custom_components/${domain}/ is deleted; it came from ${pin.source === "git" ? "a commit in the core repository" : "a release on PyPI"}, so re-pinning fetches it again.`
       : `custom_components/${domain}/ is moved to integration_pins_retired/, since this copy exists nowhere else.`;
     if (!confirm(`Unpin ${domain}?\n\n${fate}\nThe bundled version is used after the next restart.`)) return;
     const r = await this._call({ type: "integration_pins/unpin", domain }, `Unpinning ${domain}…`);
@@ -166,15 +195,11 @@ class IntegrationPinsPanel extends HTMLElement {
 
   async _runCompare() {
     const form = this.shadowRoot.querySelector("#add-form");
-    const domain = form?.domain.value.trim().toLowerCase();
-    const version = form?.version.value;
-    if (!domain || !version) {
-      this._error = "Pick an integration and a release first.";
-      return this._render();
-    }
+    const chosen = this._formSource(form);
+    if (!chosen) return;
     const r = await this._call(
-      { type: "integration_pins/compare", domain, version },
-      `Reading ${version}'s file list…`
+      { type: "integration_pins/compare", domain: chosen.domain, ...chosen.payload },
+      `Reading the file list for ${chosen.label}…`
     );
     this._compare = r;
     this._render();
@@ -306,13 +331,49 @@ class IntegrationPinsPanel extends HTMLElement {
       if (f && saved.version && f.version) f.version.value = saved.version;
     }
     this._paintDomainAids();
-    this._paintCompare();
   }
 
+  /* Everything that appears in response to what you typed or clicked lands in one
+   * block under the buttons, rather than pushing the fields apart mid-form. */
   _paintDomainAids() {
-    this._paintDomainWarning();
+    const box = this.shadowRoot.getElementById("form-messages");
+    if (box) {
+      box.innerHTML = [this._sourceWarningHtml(), this._domainWarningHtml(), this._compareHtml()]
+        .filter(Boolean)
+        .join("");
+    }
     const links = this.shadowRoot.getElementById("domain-links");
     if (links) links.innerHTML = this._domainLinksHtml();
+    this._paintFieldErrors();
+  }
+
+  _paintFieldErrors() {
+    for (const el of this.shadowRoot.querySelectorAll(".field-error")) {
+      const message = this._fieldErrors[el.dataset.for];
+      el.textContent = message || "";
+      el.hidden = !message;
+    }
+  }
+
+  _clearFieldError(name) {
+    if (!this._fieldErrors[name]) return;
+    delete this._fieldErrors[name];
+    this._paintFieldErrors();
+  }
+
+  _sourceWarningHtml() {
+    if (this._source !== "git") return "";
+    return `
+      <div class="warn-box">
+        <ha-icon icon="mdi:source-branch"></ha-icon>
+        <div>
+          Git code targets the <strong>next</strong> core release, not the one you are running.
+          Pinning an older release is protected by core's deprecation policy; pinning ahead of your
+          core is not, so the code can call helpers your core does not have yet.
+          The repository also carries English translations only — Home Assistant generates the rest
+          at release time — so a git pin falls back to English everywhere else.
+        </div>
+      </div>`;
   }
 
   /* The upstream history is the fastest way to see what changed in an integration:
@@ -331,29 +392,22 @@ class IntegrationPinsPanel extends HTMLElement {
     }`;
   }
 
-  _paintCompare() {
-    const box = this.shadowRoot.getElementById("compare-result");
-    if (box) box.innerHTML = this._compareHtml();
-  }
-
-  /* Written straight into the DOM rather than through _render(): the domain field is
-   * being typed into, and re-rendering the card would drop focus on every keystroke. */
-  _paintDomainWarning() {
-    const box = this.shadowRoot.getElementById("domain-warning");
-    if (box) box.innerHTML = this._domainWarningHtml();
-  }
-
   _onInput(ev) {
+    if (ev.target.name === "git_ref") {
+      this._gitRef = ev.target.value;
+      this._clearFieldError("git_ref");
+      return;
+    }
     if (ev.target.name !== "domain") return;
     const domain = ev.target.value.trim().toLowerCase();
     if (this._compare && this._compare.domain !== domain) {
       this._compare = null;
-      this._paintCompare();
     }
     if (this._domainInfo && this._domainInfo.domain !== domain) {
       this._domainInfo = null;
-      this._paintDomainAids();
     }
+    this._clearFieldError("domain");
+    this._paintDomainAids();
     clearTimeout(this._domainInfoTimer);
     this._domainInfoTimer = setTimeout(() => this._loadDomainInfo(domain), 250);
   }
@@ -425,6 +479,13 @@ class IntegrationPinsPanel extends HTMLElement {
         return this._deleteRetired(btn.dataset.name);
       case "clear-retired":
         return this._clearRetired();
+      case "source": {
+        if (btn.dataset.source === this._source) return;
+        this._source = btn.dataset.source;
+        this._compare = null;
+        this._fieldErrors = {};
+        return this._render();
+      }
       case "compare":
         return this._runCompare();
       case "restart":
@@ -454,8 +515,8 @@ class IntegrationPinsPanel extends HTMLElement {
     }
     if (ev.target.name === "version") {
       if (this._compare) this._compare = null;
+      this._clearFieldError("version");
       this._paintDomainAids();
-      this._paintCompare();
     }
     if (ev.target.name === "only_in_use") {
       this._onlyInUse = ev.target.checked;
@@ -538,7 +599,7 @@ class IntegrationPinsPanel extends HTMLElement {
     return `
       <div class="row ${esc(p.status)}">
         <div class="cell"><b>${esc(p.domain)}</b>${p.source === "adopted" ? ' <span class="tag">adopted</span>' : ""}</div>
-        <div class="cell mono">${esc(p.pinned_version)}</div>
+        <div class="cell mono">${esc(p.pinned_version)}${p.source === "git" ? `<div class="small">${this._gitOrigin(p)}</div>` : ""}</div>
         <div class="cell mono">${esc(p.core_range || "any")}</div>
         <div class="cell"><span class="chip ${esc(p.status)}" title="${esc(STATUS_HELP[p.status] || "")}">${esc(STATUS_LABEL[p.status] || p.status)}</span></div>
         <div class="cell actions">${actions}</div>
@@ -550,6 +611,11 @@ class IntegrationPinsPanel extends HTMLElement {
           ${editing ? this._editForm(p) : ""}
         </div>
       </div>`;
+  }
+
+  _gitOrigin(p) {
+    const commit = `https://github.com/home-assistant/core/commit/${encodeURIComponent(p.git_sha)}`;
+    return `<span class="tag">git</span> ${esc(p.git_ref)} @ <a href="${commit}" target="_blank" rel="noopener noreferrer">${esc((p.git_sha || "").slice(0, 7))}</a>`;
   }
 
   _reqDiff(p) {
@@ -585,22 +651,40 @@ class IntegrationPinsPanel extends HTMLElement {
   _addCard(snap) {
     const opts = this._versions.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
     const domains = this._onlyInUse && this._inUseDomains.length ? this._inUseDomains : this._domains;
+    const git = this._source === "git";
     return `
       <ha-card header="Pin an integration">
         <div class="card-content">
           <form id="add-form" data-form="add" class="grid-form">
             <label>Integration domain
-              <input name="domain" list="core-domains" placeholder="e.g. hue" required autocomplete="off" class="mono">
+              <span class="control">
+                <input name="domain" list="core-domains" placeholder="e.g. hue" autocomplete="off" class="mono">
+                <span class="field-error" data-for="domain" hidden></span>
+              </span>
               <datalist id="core-domains">${domains.map((d) => `<option value="${esc(d)}">`).join("")}</datalist>
               <span class="small"><input type="checkbox" name="only_in_use" ${this._onlyInUse ? "checked" : ""}> only integrations in use (${this._inUseDomains.length} of ${this._domains.length})</span>
               <div id="domain-links" class="small"></div>
             </label>
-            <div id="domain-warning" class="span-all"></div>
-            <label>Take code from release
-              <select name="version" required class="mono">
-                <option value="">${this._versions.length ? "select…" : "loading from PyPI…"}</option>${opts}
-              </select>
-              <span class="small"><input type="checkbox" name="prereleases" ${this._prereleases ? "checked" : ""}> include betas</span>
+            <label>Take code from
+              <span class="segmented">
+                <button type="button" data-action="source" data-source="release" class="${git ? "" : "on"}">a release</button>
+                <button type="button" data-action="source" data-source="git" class="${git ? "on" : ""}">git</button>
+              </span>
+              ${git ? `
+                <span class="control">
+                  <input name="git_ref" value="${esc(this._gitRef)}" placeholder="dev" autocomplete="off" class="mono">
+                  <span class="field-error" data-for="git_ref" hidden></span>
+                </span>
+                <span class="small muted">branch, tag or commit in home-assistant/core</span>
+              ` : `
+                <span class="control">
+                  <select name="version" class="mono">
+                    <option value="">${this._versions.length ? "select…" : "loading from PyPI…"}</option>${opts}
+                  </select>
+                  <span class="field-error" data-for="version" hidden></span>
+                </span>
+                <span class="small"><input type="checkbox" name="prereleases" ${this._prereleases ? "checked" : ""}> include betas</span>
+              `}
             </label>
             <label>Valid for core
               <input name="core_range" value="==${esc(snap.core_version)}" class="mono">
@@ -612,7 +696,7 @@ class IntegrationPinsPanel extends HTMLElement {
               <ha-button type="submit" raised ${this._busy ? "disabled" : ""}>Pin</ha-button>
               <ha-button data-action="compare" ${this._busy ? "disabled" : ""}>Compare with running code</ha-button>
             </div>
-            <div id="compare-result" class="span-all"></div>
+            <div id="form-messages" class="span-all"></div>
           </form>
           <div class="muted small">
             Tip: pick the last release where the integration worked. The default range is only the core you are
@@ -626,11 +710,17 @@ class IntegrationPinsPanel extends HTMLElement {
     if (!snap.unmanaged_overrides.length) return "";
     const rows = snap.unmanaged_overrides.map((o) => {
       const adopting = this._adopting === o.domain;
+      const hacs = o.source === "hacs";
       return `
         <div class="row">
           <div class="cell"><b>${esc(o.domain)}</b></div>
           <div class="cell mono">${esc(o.manifest_version || "?")}</div>
-          <div class="cell muted small" style="grid-column: span 2">custom_components/${esc(o.domain)} shadows the bundled integration but is not managed here.</div>
+          <div class="cell">${hacs
+            ? `<span class="chip hacs">HACS</span> <span class="mono small">${esc(o.source_detail)}</span>`
+            : `<span class="muted small">manual / unknown</span>`}</div>
+          <div class="cell muted small">${hacs
+            ? `HACS installs and updates this. Adopting it would put two things in charge of the same directory — leave it to HACS unless you have uninstalled it there.`
+            : `custom_components/${esc(o.domain)} shadows the bundled integration but is not managed here.`}</div>
           <div class="cell actions">${adopting ? "" : `<ha-button data-action="adopt" data-domain="${esc(o.domain)}">Adopt</ha-button>`}</div>
           ${adopting ? `
             <div class="detail">
@@ -650,7 +740,7 @@ class IntegrationPinsPanel extends HTMLElement {
       <ha-card header="Other core overrides in custom_components">
         <div class="card-content">
           <div class="table">
-            <div class="thead"><div>Integration</div><div>Manifest version</div><div></div><div></div><div></div></div>
+            <div class="thead"><div>Integration</div><div>Version</div><div>Source</div><div></div><div></div></div>
             ${rows}
           </div>
         </div>
@@ -748,6 +838,19 @@ class IntegrationPinsPanel extends HTMLElement {
       .chip { padding: 2px 10px; border-radius: 12px; font-size: 0.8em; font-weight: 500; white-space: nowrap; }
       .chip.active { background: rgba(67,160,71,.2); color: var(--success-color, #43a047); }
       #domain-links:empty { display: none; }
+      .segmented { display: inline-flex; align-self: flex-start; border: 1px solid var(--divider-color); border-radius: 6px; overflow: hidden; }
+      .segmented button { font: inherit; font-size: 0.9em; padding: 5px 12px; border: 0; cursor: pointer;
+        background: var(--card-background-color); color: var(--secondary-text-color); }
+      .segmented button.on { background: var(--primary-color); color: var(--text-primary-color, #fff); }
+      .control { position: relative; display: block; }
+      .control > input, .control > select { width: 100%; box-sizing: border-box; }
+      .field-error { position: absolute; top: calc(100% + 7px); left: 0; z-index: 5; width: max-content; max-width: 260px;
+        background: var(--error-color, #db4437); color: #fff; font-size: 0.8em; padding: 4px 8px; border-radius: 6px;
+        box-shadow: 0 2px 8px rgba(0,0,0,.25); }
+      .field-error::before { content: ""; position: absolute; bottom: 100%; left: 12px; border: 6px solid transparent;
+        border-bottom-color: var(--error-color, #db4437); }
+      #form-messages { display: flex; flex-direction: column; gap: 10px; }
+      #form-messages:empty { display: none; }
       #domain-links a { color: var(--primary-color); text-decoration: none; }
       #domain-links a:hover { text-decoration: underline; }
       .warn-box { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 8px;

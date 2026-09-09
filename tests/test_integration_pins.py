@@ -683,3 +683,283 @@ async def test_unchanged_panel_revalidates_to_an_empty_304(
 
     assert second.status == 304
     assert await second.read() == b""
+
+
+GH_API = "https://api.github.com/repos/home-assistant/core"
+GH_RAW = "https://raw.githubusercontent.com/home-assistant/core"
+FAKE_SHA = "90258e6ef6ca10d9789bd92004805143ca9b6cf0"
+FAKE_CONST_PY = (
+    "MAJOR_VERSION: Final = 2026\n"
+    "MINOR_VERSION: Final = 10\n"
+    'PATCH_VERSION: Final = "0.dev0"\n'
+    '__version__: Final = f"{__short_version__}.{PATCH_VERSION}"\n'
+)
+
+
+def _mock_github_ref(aioclient_mock, ref="dev", sha=FAKE_SHA):
+    aioclient_mock.get(f"{GH_API}/commits/{ref}", json={"sha": sha})
+    aioclient_mock.get(f"{GH_RAW}/{sha}/homeassistant/const.py", text=FAKE_CONST_PY)
+
+
+async def test_resolving_a_git_ref_records_the_commit_and_the_core_it_targets(
+    hass: HomeAssistant, setup, aioclient_mock
+):
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    _mock_github_ref(aioclient_mock)
+
+    source = await pinner.async_resolve_git_source(async_get_clientsession(hass), "dev")
+
+    assert source.ref == "dev"
+    assert source.sha == FAKE_SHA
+    assert source.core_version == "2026.10.0.dev0"
+    assert source.version == "2026.10.0.dev0+90258e6"
+
+
+async def test_resolving_an_unknown_git_ref_is_a_clean_error(
+    hass: HomeAssistant, setup, aioclient_mock
+):
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    aioclient_mock.get(f"{GH_API}/commits/nope", status=404, json={"message": "Not Found"})
+
+    with pytest.raises(pinner.PinError, match="nope"):
+        await pinner.async_resolve_git_source(async_get_clientsession(hass), "nope")
+
+
+def _mock_github_tree(aioclient_mock, domain, files, sha=FAKE_SHA, extra_tree=()):
+    tree = [{"path": p, "type": "blob", "size": len(b)} for p, b in files.items()]
+    tree.extend(extra_tree)
+    aioclient_mock.get(
+        f"{GH_API}/git/trees/{sha}:homeassistant/components/{domain}",
+        json={"tree": tree, "truncated": False},
+    )
+    for path, data in files.items():
+        aioclient_mock.get(
+            f"{GH_RAW}/{sha}/homeassistant/components/{domain}/{path}", content=data
+        )
+
+
+def _git_source():
+    return pinner.GitSource(ref="dev", sha=FAKE_SHA, core_version="2026.10.0.dev0")
+
+
+async def test_git_component_fetches_every_blob_in_the_tree(
+    hass: HomeAssistant, setup, aioclient_mock
+):
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    files = {"__init__.py": b"code", "manifest.json": b"{}", "translations/en.json": b"{}"}
+    _mock_github_tree(
+        aioclient_mock,
+        "sun",
+        files,
+        extra_tree=[
+            {"path": "translations", "type": "tree"},
+            {"path": "__pycache__/x.pyc", "type": "blob", "size": 4},
+        ],
+    )
+
+    got = await pinner.async_git_component(async_get_clientsession(hass), _git_source(), "sun")
+
+    assert got == files
+
+
+async def test_git_component_rejects_a_commit_without_that_integration(
+    hass: HomeAssistant, setup, aioclient_mock
+):
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    aioclient_mock.get(
+        f"{GH_API}/git/trees/{FAKE_SHA}:homeassistant/components/nope",
+        status=404,
+        json={"message": "Not Found"},
+    )
+
+    with pytest.raises(pinner.PinError, match="no core integration 'nope'"):
+        await pinner.async_git_component(async_get_clientsession(hass), _git_source(), "nope")
+
+
+def test_install_component_writes_the_files_manifest_version_and_marker(tmp_path):
+    files = {
+        "__init__.py": b"code",
+        "manifest.json": b'{"domain": "sun", "requirements": []}',
+        "translations/en.json": b"{}",
+    }
+
+    target = pinner.install_component(
+        files,
+        "sun",
+        "2026.10.0.dev0+90258e6",
+        str(tmp_path),
+        CORE_VERSION,
+        {"git_ref": "dev", "git_sha": FAKE_SHA},
+    )
+
+    assert (target / "__init__.py").read_bytes() == b"code"
+    assert (target / "translations" / "en.json").is_file()
+    assert json.loads((target / "manifest.json").read_text())["version"] == "2026.10.0.dev0+90258e6"
+    marker = json.loads((target / MARKER_FILE).read_text())
+    assert marker["git_ref"] == "dev" and marker["git_sha"] == FAKE_SHA
+
+
+def test_install_component_refuses_a_path_that_escapes_the_target(tmp_path):
+    files = {"manifest.json": b"{}", "../../evil.py": b"pwned"}
+
+    with pytest.raises(pinner.PinError, match="outside"):
+        pinner.install_component(files, "sun", "1.0.0", str(tmp_path), CORE_VERSION)
+
+    assert not (tmp_path.parent / "evil.py").exists()
+    assert not (tmp_path / "custom_components" / "sun").exists()
+
+
+async def test_pinning_from_git_records_the_commit_and_the_core_it_targets(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, tmp_path
+):
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(
+        aioclient_mock,
+        FAKE_DOMAIN,
+        {
+            "__init__.py": b"the fix that just landed",
+            "manifest.json": b'{"domain": "sun", "requirements": []}',
+        },
+    )
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": "dev", "core_range": ""}
+    )
+    assert (await client.receive_json())["success"]
+
+    override = tmp_path / "custom_components" / FAKE_DOMAIN
+    assert (override / "__init__.py").read_bytes() == b"the fix that just landed"
+    assert json.loads((override / "manifest.json").read_text())["version"] == (
+        "2026.10.0.dev0+90258e6"
+    )
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    (pin,) = (await client.receive_json())["result"]["pins"]
+    assert pin["source"] == "git"
+    assert pin["pinned_version"] == "2026.10.0.dev0+90258e6"
+    assert pin["git_ref"] == "dev"
+    assert pin["git_sha"] == FAKE_SHA
+    assert pin["status"] == "pending"
+
+
+async def test_pin_needs_exactly_one_of_release_or_git_ref(
+    hass: HomeAssistant, setup, hass_ws_client
+):
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN})
+    neither = await client.receive_json()
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": "2025.1.0", "git_ref": "dev"}
+    )
+    both = await client.receive_json()
+
+    for msg in (neither, both):
+        assert not msg["success"] and msg["error"]["code"] == "pin_error"
+
+
+OTHER_SHA = "1111111222222233333334444444555555566666"
+
+
+async def test_compare_works_against_a_git_ref(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(
+        aioclient_mock,
+        FAKE_DOMAIN,
+        {"__init__.py": b"new", "manifest.json": b'{"domain": "sun"}'},
+    )
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "git_ref": "dev"}
+    )
+    result = (await client.receive_json())["result"]
+
+    assert result["identical"] is False
+    assert result["compared_with"] == f"core {CORE_VERSION}"
+    assert "manifest.json" in result["changed"]
+
+
+async def test_compare_baselines_a_git_pin_against_the_commit_it_came_from(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    pinned = {"__init__.py": b"old", "manifest.json": b'{"domain": "sun"}'}
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, pinned)
+    _mock_github_ref(aioclient_mock, ref="fix", sha=OTHER_SHA)
+    _mock_github_tree(
+        aioclient_mock,
+        FAKE_DOMAIN,
+        {"__init__.py": b"new", "manifest.json": b'{"domain": "sun"}'},
+        sha=OTHER_SHA,
+    )
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": "dev"}
+    )
+    assert (await client.receive_json())["success"]
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "git_ref": "fix"}
+    )
+    result = (await client.receive_json())["result"]
+
+    assert result["compared_with"] == "pinned 2026.10.0.dev0+90258e6"
+    assert result["changed"] == ["__init__.py"]
+    assert result["added"] == [] and result["removed"] == []
+
+
+async def test_unpinning_a_git_pin_deletes_it_rather_than_retiring(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, tmp_path
+):
+    """A git pin records the commit, so its files are reproducible too."""
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(
+        aioclient_mock, FAKE_DOMAIN, {"__init__.py": b"x", "manifest.json": b'{"domain": "sun"}'}
+    )
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": "dev"}
+    )
+    assert (await client.receive_json())["success"]
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": FAKE_DOMAIN})
+    assert (await client.receive_json())["success"]
+
+    assert not (tmp_path / "custom_components" / FAKE_DOMAIN).exists()
+    assert not (tmp_path / RETIRED_DIRNAME).exists()
+
+
+async def test_unmanaged_override_reports_where_it_came_from(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+):
+    """A HACS integration that replaces a core domain lands here, not in the other list."""
+    _write_custom_integration(tmp_path, "plant", version="2.0.0")
+    storage = tmp_path / ".storage"
+    storage.mkdir(exist_ok=True)
+    (storage / "hacs.data").write_text(
+        json.dumps(
+            {
+                "data": {
+                    "repositories": {
+                        "7": {"full_name": "Olen/homeassistant-plant", "domain": "plant"}
+                    }
+                }
+            }
+        )
+    )
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    (override,) = (await client.receive_json())["result"]["unmanaged_overrides"]
+
+    assert override["domain"] == "plant"
+    assert override["source"] == "hacs"
+    assert override["source_detail"] == "Olen/homeassistant-plant"
