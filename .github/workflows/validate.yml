@@ -11,7 +11,10 @@ on:
     - cron: "0 4 * * *"
   workflow_dispatch:
 
-permissions: {}
+# checkout needs this to fetch the repository while it is still private; the HACS
+# docs use an empty set because they assume it is already public.
+permissions:
+  contents: read
 
 jobs:
   hacs:
