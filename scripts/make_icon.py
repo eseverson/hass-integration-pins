@@ -1,14 +1,13 @@
-"""Draw brand/icon.png: someone putting a stick through their own front wheel.
+"""Draw brand/icon.png from the same glyph the sidebar uses (mdi:pin).
 
-The icon is code rather than a drawing so it can be adjusted and re-rendered. Run it
-from the repository root:
+Kept as a script so the icon can be re-rendered if the colours or padding change.
+Run it from the repository root:
 
     python scripts/make_icon.py
 """
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -16,36 +15,37 @@ from PIL import Image, ImageDraw
 SIZE = 1024  # drawn large and downscaled, which is what keeps the edges clean
 BLUE = (3, 169, 244, 255)
 WHITE = (255, 255, 255, 255)
+GLYPH_SCALE = 0.62  # how much of the tile the pin occupies
 OUT = Path(__file__).resolve().parent.parent / "brand"
 
-
-def _cap_line(draw, start, end, width, fill=WHITE):
-    """A line with round ends, which PIL does not offer directly."""
-    draw.line([start, end], fill=fill, width=int(width))
-    for point in (start, end):
-        draw.ellipse(
-            [point[0] - width / 2, point[1] - width / 2, point[0] + width / 2, point[1] + width / 2],
-            fill=fill,
-        )
+# mdi:pin, viewBox 0 0 24 24. Every segment is a straight line, so the path is a
+# plain polygon: https://raw.githubusercontent.com/Templarian/MaterialDesign/master/svg/pin.svg
+PIN_PATH = "M16,12V4H17V2H7V4H8V12L6,14V16H11.2V22H12.8V16H18V14L16,12Z"
 
 
-def _halo_line(draw, start, end, width, halo=28):
-    """A line that knocks a gap out of whatever it crosses, so it reads as being in front."""
-    _cap_line(draw, start, end, width + halo * 2, BLUE)
-    _cap_line(draw, start, end, width)
-
-
-def _wheel(draw, centre, radius, rim=32, spokes=9, hub=38):
-    cx, cy = centre
-    draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], outline=WHITE, width=rim)
-    for i in range(spokes):
-        angle = math.pi * 2 * i / spokes + 0.35
-        draw.line(
-            [(cx, cy), (cx + radius * math.cos(angle), cy + radius * math.sin(angle))],
-            fill=WHITE,
-            width=13,
-        )
-    draw.ellipse([cx - hub, cy - hub, cx + hub, cy + hub], fill=WHITE)
+def parse_path(path: str) -> list[tuple[float, float]]:
+    """Read an SVG path made only of absolute M, H, V, L and Z commands."""
+    points: list[tuple[float, float]] = []
+    x = y = 0.0
+    index = 0
+    while index < len(path):
+        command = path[index]
+        index += 1
+        if command == "Z":
+            break
+        end = index
+        while end < len(path) and path[end] not in "MHVLZ":
+            end += 1
+        numbers = [float(n) for n in path[index:end].replace(",", " ").split()]
+        index = end
+        if command == "M" or command == "L":
+            x, y = numbers[0], numbers[1]
+        elif command == "H":
+            x = numbers[0]
+        elif command == "V":
+            y = numbers[0]
+        points.append((x, y))
+    return points
 
 
 def render() -> Image.Image:
@@ -53,18 +53,9 @@ def render() -> Image.Image:
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle([0, 0, SIZE - 1, SIZE - 1], radius=int(SIZE * 0.22), fill=BLUE)
 
-    hub = (335, 665)
-    _wheel(draw, hub, 240)
-    _cap_line(draw, hub, (505, 445), 26)  # a fork, so the wheel belongs to a bicycle
-
-    draw.ellipse([700, 165, 856, 321], fill=WHITE)  # head
-    _cap_line(draw, (772, 315), (850, 545), 94)  # torso, hunched forward
-    _cap_line(draw, (850, 545), (745, 775), 60)  # leg
-    _cap_line(draw, (762, 372), (648, 478), 56)  # upper arm
-    _cap_line(draw, (648, 478), (548, 588), 46)  # forearm
-
-    _halo_line(draw, (655, 512), (300, 706), 34)  # the stick, held mid-length
-    draw.ellipse([492, 532, 604, 644], fill=WHITE)  # hand closed over it
+    scale = SIZE * GLYPH_SCALE / 24
+    offset = (SIZE - 24 * scale) / 2
+    draw.polygon([(offset + px * scale, offset + py * scale) for px, py in parse_path(PIN_PATH)], fill=WHITE)
     return img
 
 

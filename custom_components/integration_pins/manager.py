@@ -365,7 +365,11 @@ class PinManager:
         _LOGGER.info(
             "Pinning %s to Home Assistant %s (%.1f MB wheel)", domain, version, wheel.size / 1e6
         )
-        with tempfile.TemporaryDirectory(prefix="integration_pins.") as tmp:
+        # Staged next to where it is going rather than in /tmp: Home Assistant OS mounts
+        # /tmp as a tmpfs, so a 30-50 MB wheel there is 30-50 MB of RAM on a small box.
+        with tempfile.TemporaryDirectory(
+            prefix=".integration_pins.", dir=self.hass.config.config_dir
+        ) as tmp:
             wheel_path = Path(tmp) / f"homeassistant-{version}.whl"
             await pinner.async_download(session, wheel, wheel_path)
             await self.hass.async_add_executor_job(
