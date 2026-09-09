@@ -1,0 +1,27 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Integration Pins",
+        "description": "Adds an 'Integration Pins' sidebar panel for running a specific release's copy of a core integration."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Already configured. Only a single configuration possible."
+    }
+  },
+  "issues": {
+    "pin_out_of_range": {
+      "title": "Pinned integration {domain} is outside its core range",
+      "description": "The override for `{domain}` was copied from Home Assistant {pinned_version} and marked valid for core versions `{core_range}`. You are now running {core_version}. The pinned code is still being loaded. Open the Integration Pins panel to widen the range if it still works, or unpin it to go back to the bundled version (restart required)."
+    },
+    "pin_missing": {
+      "title": "Pinned integration {domain} has no override directory",
+      "description": "A pin for `{domain}` (Home Assistant {pinned_version}) is recorded, but `custom_components/{domain}` no longer exists, so the bundled version is what is running. Re-pin it from the Integration Pins panel or remove the pin."
+    },
+    "pin_foreign": {
+      "title": "Override for {domain} was not written by Integration Pins",
+      "description": "`custom_components/{domain}` exists but does not carry the marker for the pin recorded here (Home Assistant {pinned_version}). Something else replaced it. Re-pin from the Integration Pins panel to restore the recorded version, or adopt the directory as-is."
+    }
+  }
+}

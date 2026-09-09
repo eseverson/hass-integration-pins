@@ -1,0 +1,14 @@
+{
+  "domain": "integration_pins",
+  "name": "Integration Pins",
+  "codeowners": ["@eseverson"],
+  "config_flow": true,
+  "dependencies": ["http", "frontend", "panel_custom", "websocket_api", "repairs"],
+  "documentation": "https://github.com/eseverson/hass-integration-pins",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/eseverson/hass-integration-pins/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
