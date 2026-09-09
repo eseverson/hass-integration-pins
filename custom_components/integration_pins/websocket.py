@@ -49,6 +49,8 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_update)
     websocket_api.async_register_command(hass, ws_unpin)
     websocket_api.async_register_command(hass, ws_check)
+    websocket_api.async_register_command(hass, ws_delete_retired)
+    websocket_api.async_register_command(hass, ws_clear_retired)
 
 
 @websocket_api.require_admin
@@ -194,3 +196,23 @@ async def ws_unpin(hass, connection, msg: dict[str, Any]) -> None:
 async def ws_check(hass, connection, msg: dict[str, Any]) -> None:
     await _manager(hass).async_check()
     connection.send_result(msg["id"])
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/delete_retired", vol.Required("name"): str}
+)
+@websocket_api.async_response
+@_wrap
+async def ws_delete_retired(hass, connection, msg: dict[str, Any]) -> None:
+    await _manager(hass).async_delete_retired(msg["name"])
+    connection.send_result(msg["id"])
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/clear_retired"})
+@websocket_api.async_response
+@_wrap
+async def ws_clear_retired(hass, connection, msg: dict[str, Any]) -> None:
+    removed = await _manager(hass).async_clear_retired()
+    connection.send_result(msg["id"], {"removed": removed})

@@ -151,8 +151,7 @@ async def test_pin_update_unpin_flow(
     await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": FAKE_DOMAIN})
     assert (await client.receive_json())["success"]
     assert not override.exists()
-    retired = list((tmp_path / RETIRED_DIRNAME).iterdir())
-    assert len(retired) == 1 and retired[0].name.startswith(f"{FAKE_DOMAIN}-{FAKE_VERSION}-")
+    assert not (tmp_path / RETIRED_DIRNAME).exists()  # pypi pins are re-downloadable
     await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
     assert (await client.receive_json())["result"]["pins"] == []
 
@@ -447,3 +446,101 @@ async def test_custom_integration_listing_excludes_pins_and_core_shadows(
     listed = {e["domain"] for e in snap["custom_integrations"]}
     assert listed == set()  # hue is a core shadow, sun is pinned, integration_pins is us
     assert [o["domain"] for o in snap["unmanaged_overrides"]] == ["hue"]
+
+
+async def test_unpinning_a_pypi_pin_deletes_it_rather_than_retiring(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
+):
+    """A pypi pin records domain + release, so the files can always be fetched again."""
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    assert (await client.receive_json())["success"]
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": FAKE_DOMAIN})
+    assert (await client.receive_json())["success"]
+
+    assert not (tmp_path / "custom_components" / FAKE_DOMAIN).exists()
+    assert not (tmp_path / RETIRED_DIRNAME).exists()
+
+
+async def test_unpinning_an_adopted_pin_retires_it(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+):
+    """An adopted directory was placed by hand and exists nowhere else."""
+    manual = _write_custom_integration(tmp_path, "hue", version="2025.11.0")
+    _mark_loaded(hass, "hue", manual)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/adopt", "domain": "hue", "pinned_version": "2025.11.0"}
+    )
+    assert (await client.receive_json())["success"]
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": "hue"})
+    assert (await client.receive_json())["success"]
+
+    retired = list((tmp_path / RETIRED_DIRNAME).iterdir())
+    assert len(retired) == 1 and retired[0].name.startswith("hue-2025.11.0-")
+
+
+async def test_snapshot_lists_retired_directories_with_sizes(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+):
+    retired = tmp_path / RETIRED_DIRNAME / "hue-2025.11.0-20260101T000000Z"
+    retired.mkdir(parents=True)
+    (retired / "__init__.py").write_bytes(b"x" * 1234)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    (entry,) = (await client.receive_json())["result"]["retired"]
+
+    assert entry["name"] == "hue-2025.11.0-20260101T000000Z"
+    assert entry["bytes"] == 1234
+
+
+async def test_delete_retired_removes_one_entry(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+):
+    root = tmp_path / RETIRED_DIRNAME
+    (root / "hue-a").mkdir(parents=True)
+    (root / "zha-b").mkdir(parents=True)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/delete_retired", "name": "hue-a"})
+    assert (await client.receive_json())["success"]
+
+    assert [p.name for p in root.iterdir()] == ["zha-b"]
+
+
+async def test_delete_retired_refuses_a_path_outside_the_retired_folder(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+):
+    victim = tmp_path / "custom_components" / "hue"
+    victim.mkdir(parents=True)
+    (tmp_path / RETIRED_DIRNAME).mkdir()
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/delete_retired", "name": "../custom_components/hue"}
+    )
+    msg = await client.receive_json()
+
+    assert msg["error"]["code"] == "pin_error"
+    assert "not a retired override" in msg["error"]["message"]
+    assert victim.exists()
+
+
+async def test_clear_retired_empties_the_folder(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+):
+    root = tmp_path / RETIRED_DIRNAME
+    (root / "hue-a").mkdir(parents=True)
+    (root / "zha-b").mkdir(parents=True)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/clear_retired"})
+    assert (await client.receive_json())["success"]
+
+    assert list(root.iterdir()) == []

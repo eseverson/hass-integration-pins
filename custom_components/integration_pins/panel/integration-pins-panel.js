@@ -22,6 +22,13 @@ const STATUS_HELP = {
   foreign: "custom_components/<domain> exists but was not written by this pin (marker mismatch).",
 };
 
+const fmtBytes = (n) => {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+};
+
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
@@ -146,9 +153,27 @@ class IntegrationPinsPanel extends HTMLElement {
   }
 
   async _unpin(domain) {
-    if (!confirm(`Unpin ${domain}?\n\nThe override directory is moved to integration_pins_retired/ and the bundled version is used after the next restart.`)) return;
+    const pin = this._snapshot?.pins.find((p) => p.domain === domain);
+    const fate = pin && pin.source === "pypi"
+      ? `custom_components/${domain}/ is deleted; it came from a release on PyPI, so re-pinning fetches it again.`
+      : `custom_components/${domain}/ is moved to integration_pins_retired/, since this copy exists nowhere else.`;
+    if (!confirm(`Unpin ${domain}?\n\n${fate}\nThe bundled version is used after the next restart.`)) return;
     const r = await this._call({ type: "integration_pins/unpin", domain }, `Unpinning ${domain}…`);
     if (r !== null) this._notice = `Unpinned ${domain}. Restart Home Assistant to apply.`;
+    this._render();
+  }
+
+  async _deleteRetired(name) {
+    if (!confirm(`Delete ${name}?\n\nThis removes the retired copy from disk for good.`)) return;
+    await this._call({ type: "integration_pins/delete_retired", name }, `Deleting ${name}…`);
+  }
+
+  async _clearRetired() {
+    const items = this._snapshot?.retired || [];
+    const total = fmtBytes(items.reduce((a, r) => a + r.bytes, 0));
+    if (!confirm(`Delete all ${items.length} retired copies (${total})?\n\nThis cannot be undone.`)) return;
+    const r = await this._call({ type: "integration_pins/clear_retired" }, "Clearing…");
+    if (r !== null) this._notice = `Deleted ${r.removed} retired ${r.removed === 1 ? "copy" : "copies"}.`;
     this._render();
   }
 
@@ -315,6 +340,10 @@ class IntegrationPinsPanel extends HTMLElement {
       case "cancel-adopt":
         this._adopting = null;
         return this._render();
+      case "delete-retired":
+        return this._deleteRetired(btn.dataset.name);
+      case "clear-retired":
+        return this._clearRetired();
       case "restart":
         return this._restart();
       case "refresh":
@@ -371,6 +400,7 @@ class IntegrationPinsPanel extends HTMLElement {
         ${this._addCard(snap)}
         ${this._unmanagedCard(snap)}
         ${this._customIntegrationsCard(snap)}
+        ${this._retiredCard(snap)}
         <p class="muted small">
           How it works: Home Assistant loads <code>custom_components/&lt;domain&gt;</code> in
           preference to the bundled integration of the same name. Pinning extracts that
@@ -531,6 +561,37 @@ class IntegrationPinsPanel extends HTMLElement {
           <div class="table">
             <div class="thead"><div>Integration</div><div>Manifest version</div><div></div><div></div><div></div></div>
             ${rows}
+          </div>
+        </div>
+      </ha-card>`;
+  }
+
+  _retiredCard(snap) {
+    const items = snap.retired || [];
+    if (!items.length) return "";
+    const total = fmtBytes(items.reduce((a, r) => a + r.bytes, 0));
+    const rows = items.map((r) => `
+        <div class="row">
+          <div class="cell mono">${esc(r.name)}</div>
+          <div class="cell mono">${esc(fmtBytes(r.bytes))}</div>
+          <div class="cell actions">
+            <ha-button data-action="delete-retired" data-name="${esc(r.name)}" ${this._busy ? "disabled" : ""}>Delete</ha-button>
+          </div>
+        </div>`).join("");
+    return `
+      <ha-card header="Retired overrides (${total})">
+        <div class="card-content">
+          <div class="table cols-3">
+            <div class="thead"><div>Directory</div><div>Size</div><div></div></div>
+            ${rows}
+          </div>
+          <div class="form-actions">
+            <ha-button data-action="clear-retired" ${this._busy ? "disabled" : ""}>Clear all</ha-button>
+          </div>
+          <div class="muted small">
+            Copies kept in <code>integration_pins_retired/</code> when an override was taken out of
+            <code>custom_components/</code>. Unpinning something pinned from PyPI deletes it instead of
+            keeping a copy, so only hand-placed code ends up here. Nothing is removed automatically.
           </div>
         </div>
       </ha-card>`;

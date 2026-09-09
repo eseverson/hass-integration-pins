@@ -95,6 +95,7 @@ class PinManager:
         custom = await self.hass.async_add_executor_job(
             pinner.list_custom_integrations, config_dir, set(self.store.pins) | {DOMAIN}
         )
+        retired = await self.hass.async_add_executor_job(pinner.list_retired, config_dir)
         return {
             "core_version": CORE_VERSION,
             "restart_required": self._removal_pending
@@ -102,6 +103,7 @@ class PinManager:
             "pins": pins,
             "unmanaged_overrides": unmanaged,
             "custom_integrations": custom,
+            "retired": retired,
         }
 
     async def async_core_domains(self) -> list[str]:
@@ -255,16 +257,38 @@ class PinManager:
             raise PinError(f"No pin for '{domain}'")
         async with self._lock:
             if not keep_files:
+                # A pypi pin records the release it came from, so the files can always be
+                # fetched again; an adopted one was placed by hand and exists nowhere else.
+                keep_a_copy = pin.source != "pypi"
                 retired = await self.hass.async_add_executor_job(
-                    pinner.remove_override, domain, pin.pinned_version, self.hass.config.config_dir
+                    pinner.remove_override,
+                    domain,
+                    pin.pinned_version,
+                    self.hass.config.config_dir,
+                    keep_a_copy,
                 )
                 if retired:
                     _LOGGER.info("Retired override for %s to %s", domain, retired)
+                else:
+                    _LOGGER.info("Deleted override for %s (re-pinnable from PyPI)", domain)
                 self._removal_pending = True
             await self.store.async_remove(domain)
         for issue in (ISSUE_OUT_OF_RANGE, ISSUE_MISSING, ISSUE_FOREIGN):
             ir.async_delete_issue(self.hass, DOMAIN, f"{issue}_{domain}")
         await self.async_check()
+
+    async def async_delete_retired(self, name: str) -> None:
+        await self.hass.async_add_executor_job(
+            pinner.delete_retired, self.hass.config.config_dir, name
+        )
+        self._notify()
+
+    async def async_clear_retired(self) -> int:
+        removed = await self.hass.async_add_executor_job(
+            pinner.clear_retired, self.hass.config.config_dir
+        )
+        self._notify()
+        return removed
 
     # -- checks / repairs ----------------------------------------------------
 

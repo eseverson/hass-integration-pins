@@ -293,12 +293,72 @@ def _retire(path: Path, config_dir: str, label: str) -> Path:
     return dest
 
 
-def remove_override(domain: str, pinned_version: str, config_dir: str) -> Path | None:
-    """Move an override out of custom_components. Returns the retired path."""
+def remove_override(
+    domain: str, pinned_version: str, config_dir: str, retire: bool = True
+) -> Path | None:
+    """Take an override out of custom_components. Returns the retired path, if kept."""
     target = custom_components_dir(config_dir) / domain
     if not target.exists():
         return None
+    if not retire:
+        shutil.rmtree(target)
+        return None
     return _retire(target, config_dir, f"{domain}-{pinned_version}")
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total
+
+
+def list_retired(config_dir: str) -> list[dict[str, Any]]:
+    root = retired_dir(config_dir)
+    if not root.is_dir():
+        return []
+    entries = []
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        entries.append({"name": path.name, "bytes": _dir_size(path), "modified": modified})
+    entries.sort(key=lambda e: e["modified"], reverse=True)
+    return entries
+
+
+def _retired_path(config_dir: str, name: str) -> Path:
+    """Resolve a retired entry by name, refusing anything that leaves the folder."""
+    root = retired_dir(config_dir).resolve()
+    candidate = (root / name).resolve()
+    if candidate.parent != root or not candidate.is_dir():
+        raise PinError(f"'{name}' is not a retired override")
+    return candidate
+
+
+def delete_retired(config_dir: str, name: str) -> None:
+    shutil.rmtree(_retired_path(config_dir, name))
+
+
+def clear_retired(config_dir: str) -> int:
+    root = retired_dir(config_dir)
+    if not root.is_dir():
+        return 0
+    removed = 0
+    for path in list(root.iterdir()):
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        removed += 1
+    return removed
 
 
 def inspect_override(domain: str, config_dir: str) -> dict[str, Any]:
