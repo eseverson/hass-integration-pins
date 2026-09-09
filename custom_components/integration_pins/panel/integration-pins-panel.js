@@ -54,6 +54,7 @@ class IntegrationPinsPanel extends HTMLElement {
     this._source = "release"; // "release" (a PyPI wheel) or "git" (a commit in core)
     this._gitRef = "dev";
     this._fieldErrors = {}; // field name -> message, shown against the input itself
+    this._resetting = false; // set for one render, to drop the values instead of keeping them
     this._versions = [];
     this._released = {}; // version -> YYYY-MM-DD it shipped, for "changed since" links
     this._prereleases = false;
@@ -187,10 +188,22 @@ class IntegrationPinsPanel extends HTMLElement {
     );
     if (r) {
       this._notice = `Pinned ${chosen.domain} to ${r.pinned_version}. Restart Home Assistant to load it.`;
-      this._compare = null;
-      form.reset();
-      this._render();
+      this._resetAddForm();
     }
+  }
+
+  /* Reset the state the form renders from, not the form element: _call() re-renders
+   * when it finishes, so the node this was submitted from is already detached and
+   * resetting it would change nothing on screen. The two checkboxes are view
+   * preferences rather than pin inputs, so they stay as they were. */
+  _resetAddForm() {
+    this._source = "release";
+    this._gitRef = "dev";
+    this._domainInfo = null;
+    this._compare = null;
+    this._fieldErrors = {};
+    this._resetting = true;
+    this._render();
   }
 
   async _unpin(domain) {
@@ -341,9 +354,11 @@ class IntegrationPinsPanel extends HTMLElement {
       this.shadowRoot.addEventListener("input", (ev) => this._onInput(ev));
     }
     const root = this.shadowRoot.getElementById("root");
-    // Preserve focus/values in the add form across re-renders.
-    const addForm = root.querySelector("#add-form");
+    // Preserve focus/values in the add form across re-renders -- unless the form was
+    // just submitted, in which case the point is to get the defaults back.
+    const addForm = this._resetting ? null : root.querySelector("#add-form");
     const saved = addForm ? Object.fromEntries(new FormData(addForm)) : null;
+    this._resetting = false;
     root.innerHTML = this._html();
     if (saved) {
       const f = root.querySelector("#add-form");
