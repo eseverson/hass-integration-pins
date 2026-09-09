@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant, callback
 
 from .const import DOMAIN
 from .manager import PinManager
-from .pinner import PinError
+from .pinner import MigrationBlocked, PinError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +27,8 @@ def _wrap(func):
     async def wrapper(hass, connection, msg):
         try:
             await func(hass, connection, msg)
+        except MigrationBlocked as err:
+            connection.send_error(msg["id"], "migration_blocked", str(err))
         except PinError as err:
             connection.send_error(msg["id"], "pin_error", str(err))
         except Exception as err:  # noqa: BLE001
@@ -130,13 +132,19 @@ async def ws_versions(hass, connection, msg: dict[str, Any]) -> None:
         vol.Optional("git_ref", default=""): str,
         vol.Optional("core_range", default=""): str,
         vol.Optional("reason", default=""): str,
+        vol.Optional("acknowledge_migration", default=False): bool,
     }
 )
 @websocket_api.async_response
 @_wrap
 async def ws_pin(hass, connection, msg: dict[str, Any]) -> None:
     pin = await _manager(hass).async_pin(
-        msg["domain"], msg["version"], msg["core_range"], msg["reason"], msg["git_ref"]
+        msg["domain"],
+        msg["version"],
+        msg["core_range"],
+        msg["reason"],
+        msg["git_ref"],
+        msg["acknowledge_migration"],
     )
     connection.send_result(msg["id"], pin.as_dict())
 

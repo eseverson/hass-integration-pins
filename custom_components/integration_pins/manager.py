@@ -30,12 +30,16 @@ from .const import (
     STATUS_OUT_OF_RANGE,
     STATUS_PENDING,
 )
-from .pinner import PinError
+from .pinner import MigrationBlocked, PinError
 from .store import Pin, PinStore
 
 _LOGGER = logging.getLogger(__name__)
 
 SIGNAL_UPDATED = f"{DOMAIN}_updated"
+
+# The files that say what pinning would do to a stored config entry: the flow declares
+# the schema version, and the component declares whether it can migrate one.
+MIGRATION_FILES = ["config_flow.py", "__init__.py"]
 
 
 class PinManager:
@@ -157,17 +161,21 @@ class PinManager:
 
         if git_ref:
             source = await pinner.async_resolve_git_source(session, git_ref)
-            candidate = pinner.digest_files(
-                await pinner.async_git_component(session, source, domain)
-            )
+            files = await pinner.async_git_component(session, source, domain)
+            candidate = pinner.digest_files(files)
+            probe = {name: files[name] for name in MIGRATION_FILES if name in files}
             label = f"{source.ref} @ {source.sha[:7]}"
             since = source.date
         else:
             pinner.parse_version(version)
             wheel = await pinner.async_get_wheel(session, version)
-            candidate = await pinner.async_component_entries(session, wheel, domain)
+            entries = await pinner.async_central_directory(session, wheel)
+            candidate = pinner.component_digest(entries, domain)
             if not candidate:
                 raise PinError(f"Home Assistant {version} has no core integration '{domain}'")
+            probe = await pinner.async_read_entries(
+                session, wheel, entries, domain, MIGRATION_FILES
+            )
             label = version
             since = wheel.released
 
@@ -179,6 +187,7 @@ class PinManager:
             "version": label,
             "compared_with": compared_with,
             "since": since,
+            "migration": self.async_migration_check(domain, probe),
             "identical": not (result["added"] or result["removed"] or result["changed"]),
         }
 
@@ -219,6 +228,54 @@ class PinManager:
         digest = await self.hass.async_add_executor_job(pinner.local_component_digest, path)
         return digest, f"core {CORE_VERSION}"
 
+    @callback
+    def async_migration_check(self, domain: str, files: dict[str, bytes]) -> dict[str, Any]:
+        """What pinning this code would do to the config entry already stored.
+
+        Home Assistant compares the stored entry's version with the ConfigFlow's. Equal
+        majors are fine. A higher one in the code runs async_migrate_entry, which rewrites
+        the entry and is not undone by unpinning. A lower one either finds no migration
+        handler and fails outright, or hands a newer entry to a migration written to move
+        forward, which almost always fails too.
+        """
+        markers = pinner.migration_markers(files)
+        source = files.get("config_flow.py")
+        code = pinner.config_entry_schema(source.decode("utf-8", "replace")) if source else None
+        entries = self.hass.config_entries.async_entries(domain)
+        stored = max(((e.version, e.minor_version) for e in entries), default=None)
+
+        result = {
+            "stored": list(stored) if stored else None,
+            "code": list(code) if code else None,
+            "unique_id_migration": markers["unique_id"],
+            "has_migrate_handler": markers["config_entry"],
+        }
+        if code is None:
+            return {**result, "verdict": "unknown"}
+        if stored is None:
+            return {**result, "verdict": "no_entry"}
+        if stored == code:
+            return {**result, "verdict": "same"}
+        if stored[0] == code[0]:
+            return {**result, "verdict": "minor"}
+        if code[0] > stored[0]:
+            return {**result, "verdict": "forward"}
+        return {**result, "verdict": "downgrade" if markers["config_entry"] else "blocked"}
+
+    @callback
+    def _guard_migration(
+        self, domain: str, files: dict[str, bytes], acknowledged: bool
+    ) -> dict[str, Any]:
+        check = self.async_migration_check(domain, files)
+        if check["verdict"] == "blocked" and not acknowledged:
+            stored, code = check["stored"], check["code"]
+            raise MigrationBlocked(
+                f"This code expects config entry version {code[0]} but '{domain}' has "
+                f"stored version {stored[0]}, and the code has no migration handler, so "
+                "Home Assistant will refuse to set it up. Tick the box to pin it anyway."
+            )
+        return check
+
     async def async_versions(self, include_prereleases: bool) -> dict[str, str]:
         session = async_get_clientsession(self.hass)
         return await pinner.async_list_versions(session, include_prereleases)
@@ -252,6 +309,7 @@ class PinManager:
         core_range: str = "",
         reason: str = "",
         git_ref: str = "",
+        acknowledge_migration: bool = False,
     ) -> Pin:
         domain = domain.strip().lower()
         version = version.strip()
@@ -272,11 +330,11 @@ class PinManager:
             session = async_get_clientsession(self.hass)
             if git_ref:
                 pinned_version, provenance = await self._async_install_from_git(
-                    domain, git_ref, session
+                    domain, git_ref, session, acknowledge_migration
                 )
             else:
                 pinned_version, provenance = await self._async_install_from_release(
-                    domain, version, session
+                    domain, version, session, acknowledge_migration
                 )
             pin = Pin(
                 domain=domain,
@@ -293,10 +351,17 @@ class PinManager:
         return pin
 
     async def _async_install_from_release(
-        self, domain: str, version: str, session: Any
+        self, domain: str, version: str, session: Any, acknowledged: bool = False
     ) -> tuple[str, dict[str, str]]:
         pinner.parse_version(version)
         wheel = await pinner.async_get_wheel(session, version)
+        # Checked from the wheel's index before the body is fetched, so a pin that cannot
+        # work is refused for a few kilobytes rather than fifty megabytes.
+        self._guard_migration(
+            domain,
+            await pinner.async_read_wheel_files(session, wheel, domain, MIGRATION_FILES),
+            acknowledged,
+        )
         _LOGGER.info(
             "Pinning %s to Home Assistant %s (%.1f MB wheel)", domain, version, wheel.size / 1e6
         )
@@ -314,10 +379,11 @@ class PinManager:
         return version, {}
 
     async def _async_install_from_git(
-        self, domain: str, git_ref: str, session: Any
+        self, domain: str, git_ref: str, session: Any, acknowledged: bool = False
     ) -> tuple[str, dict[str, str]]:
         source = await pinner.async_resolve_git_source(session, git_ref)
         files = await pinner.async_git_component(session, source, domain)
+        self._guard_migration(domain, files, acknowledged)
         _LOGGER.info(
             "Pinning %s to %s @ %s (%d files, targets core %s)",
             domain,

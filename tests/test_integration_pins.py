@@ -176,11 +176,12 @@ async def test_pin_rejects_unknown_domain_and_missing_component(
 
 
 async def test_bad_sha256_rejected(hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path):
+    data = fake_wheel.read_bytes()
     aioclient_mock.get(
         f"https://pypi.org/pypi/homeassistant/{FAKE_VERSION}/json",
-        json={"urls": [{"packagetype": "bdist_wheel", "url": "https://files.example/ha.whl", "digests": {"sha256": "0" * 64}, "size": 1}]},
+        json={"urls": [{"packagetype": "bdist_wheel", "url": "https://files.example/ha.whl", "digests": {"sha256": "0" * 64}, "size": len(data)}]},
     )
-    aioclient_mock.get("https://files.example/ha.whl", content=fake_wheel.read_bytes())
+    aioclient_mock.get("https://files.example/ha.whl", content=data)
     client = await hass_ws_client(hass)
     await client.send_json_auto_id({"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION})
     msg = await client.receive_json()
@@ -554,7 +555,7 @@ def test_parse_central_directory_matches_the_zip_it_came_from(tmp_path):
 
     entries = pinner.parse_central_directory(wheel.read_bytes())
 
-    assert entries == expected
+    assert {name: (e.crc, e.size) for name, e in entries.items()} == expected
 
 
 def test_local_component_digest_skips_bytecode(tmp_path):
@@ -1040,3 +1041,174 @@ async def test_compare_against_git_reports_the_commit_date(
     result = (await client.receive_json())["result"]
 
     assert result["since"] == "2026-09-08"
+
+
+def test_config_entry_schema_defaults_to_one_when_undeclared():
+    """Home Assistant's ConfigFlow defaults both to 1, so an absent value is knowable."""
+    assert pinner.config_entry_schema("class Flow(ConfigFlow, domain=DOMAIN):\n    pass\n") == (1, 1)
+
+
+def test_config_entry_schema_reads_the_declared_versions():
+    source = (
+        "class EcobeeFlow(ConfigFlow, domain=DOMAIN):\n"
+        "    VERSION = 3\n"
+        "    MINOR_VERSION = 2\n"
+        "\n"
+        "class EcobeeOptionsFlow(OptionsFlow):\n"
+        "    pass\n"
+    )
+
+    assert pinner.config_entry_schema(source) == (3, 2)
+
+
+def test_migration_markers_find_config_entry_and_unique_id_migrations():
+    files = {
+        "__init__.py": b"async def async_migrate_entry(hass, entry) -> bool:\n    return True\n",
+        "sensor.py": b"await er.async_migrate_entries(hass, entry.entry_id, _migrate)\n",
+    }
+
+    assert pinner.migration_markers(files) == {"config_entry": True, "unique_id": True}
+
+
+def test_migration_markers_ignore_ordinary_registry_writes():
+    """async_update_entity is used for renames and device classes far more than migrations."""
+    files = {"sensor.py": b"registry.async_update_entity(entity_id, name='New name')\n"}
+
+    assert pinner.migration_markers(files) == {"config_entry": False, "unique_id": False}
+
+
+async def test_reading_named_files_out_of_a_wheel_without_downloading_it(
+    hass: HomeAssistant, setup, aioclient_mock, fake_wheel
+):
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    _mock_pypi(aioclient_mock, fake_wheel)
+    session = async_get_clientsession(hass)
+    wheel = await pinner.async_get_wheel(session, FAKE_VERSION)
+
+    files = await pinner.async_read_wheel_files(
+        session, wheel, FAKE_DOMAIN, ["manifest.json", "__init__.py", "not_there.py"]
+    )
+
+    assert json.loads(files["manifest.json"])["domain"] == FAKE_DOMAIN
+    assert files["__init__.py"] == f'"""fake {FAKE_DOMAIN} from {FAKE_VERSION}"""\n'.encode()
+    assert "not_there.py" not in files
+
+
+CONFIG_FLOW = "class SunFlow(ConfigFlow, domain=DOMAIN):\n    VERSION = {major}\n"
+MIGRATE_HANDLER = "async def async_migrate_entry(hass, entry) -> bool:\n    return True\n"
+
+
+def _git_code(major, *, handler=False, unique_id=False):
+    init = MIGRATE_HANDLER if handler else "async def async_setup_entry(hass, entry):\n    ...\n"
+    if unique_id:
+        init += "await er.async_migrate_entries(hass, entry.entry_id, _migrate)\n"
+    return {
+        "manifest.json": b'{"domain": "sun", "requirements": []}',
+        "config_flow.py": CONFIG_FLOW.format(major=major).encode(),
+        "__init__.py": init.encode(),
+    }
+
+
+async def _compare_git(hass_ws_client, hass):
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "git_ref": "dev"}
+    )
+    return (await client.receive_json())["result"]["migration"]
+
+
+async def test_compare_reports_a_pin_that_cannot_set_up(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    """Older code with no migration handler cannot read an entry a newer one wrote."""
+    MockConfigEntry(domain=FAKE_DOMAIN, version=3, minor_version=1).add_to_hass(hass)
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, _git_code(2))
+
+    migration = await _compare_git(hass_ws_client, hass)
+
+    assert migration["verdict"] == "blocked"
+    assert migration["stored"] == [3, 1] and migration["code"] == [2, 1]
+
+
+async def test_compare_flags_a_migration_that_unpinning_will_not_undo(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    """Newer code migrates the stored entry for good; the bundled code then cannot read it."""
+    MockConfigEntry(domain=FAKE_DOMAIN, version=1, minor_version=1).add_to_hass(hass)
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, _git_code(2, handler=True))
+
+    migration = await _compare_git(hass_ws_client, hass)
+
+    assert migration["verdict"] == "forward"
+
+
+async def test_compare_flags_a_unique_id_migration_in_the_code(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    MockConfigEntry(domain=FAKE_DOMAIN, version=1, minor_version=1).add_to_hass(hass)
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, _git_code(1, unique_id=True))
+
+    migration = await _compare_git(hass_ws_client, hass)
+
+    assert migration["verdict"] == "same"
+    assert migration["unique_id_migration"] is True
+
+
+async def test_compare_says_nothing_to_migrate_when_the_integration_is_not_configured(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, _git_code(3))
+
+    migration = await _compare_git(hass_ws_client, hass)
+
+    assert migration["verdict"] == "no_entry"
+
+
+async def test_pin_refuses_a_blocked_migration_until_it_is_acknowledged(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, tmp_path
+):
+    MockConfigEntry(domain=FAKE_DOMAIN, version=3, minor_version=1).add_to_hass(hass)
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, _git_code(2))
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": "dev"}
+    )
+    refused = await client.receive_json()
+
+    # Its own code, so the panel can offer the tick without matching on message text.
+    assert not refused["success"] and refused["error"]["code"] == "migration_blocked"
+    assert not (tmp_path / "custom_components" / FAKE_DOMAIN).exists()
+
+    await client.send_json_auto_id(
+        {
+            "type": f"{DOMAIN}/pin",
+            "domain": FAKE_DOMAIN,
+            "git_ref": "dev",
+            "acknowledge_migration": True,
+        }
+    )
+    assert (await client.receive_json())["success"]
+    assert (tmp_path / "custom_components" / FAKE_DOMAIN).is_dir()
+
+
+async def test_pin_from_a_release_checks_the_migration_before_downloading(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, tmp_path
+):
+    MockConfigEntry(domain=FAKE_DOMAIN, version=3, minor_version=1).add_to_hass(hass)
+    wheel = build_fake_wheel(tmp_path, extra={"config_flow.py": CONFIG_FLOW.format(major=2)})
+    _mock_pypi(aioclient_mock, wheel)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    msg = await client.receive_json()
+
+    assert not msg["success"] and "config entry" in msg["error"]["message"]

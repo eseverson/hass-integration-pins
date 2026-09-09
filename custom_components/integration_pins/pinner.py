@@ -45,6 +45,10 @@ class PinError(HomeAssistantError):
     """Raised for user-facing pin failures."""
 
 
+class MigrationBlocked(PinError):
+    """The pinned code could not read the config entry this instance has stored."""
+
+
 def parse_version(text: str) -> Version:
     try:
         return Version(text)
@@ -272,6 +276,42 @@ async def async_git_component(
 
 
 # ---------------------------------------------------------------------------
+# Migrations
+#
+# The one thing about a pin that is not reversible. Home Assistant stores a schema
+# version on every config entry and compares it with the ConfigFlow's; when the majors
+# differ it either refuses to set the integration up or runs async_migrate_entry, which
+# rewrites the stored entry for good. Both numbers default to 1, so an integration that
+# declares neither is still known rather than merely unread.
+# ---------------------------------------------------------------------------
+
+# Four spaces: a class attribute of the flow itself, not of a nested options flow.
+_FLOW_VERSION_RE = re.compile(r"^ {4}VERSION\s*=\s*(\d+)", re.MULTILINE)
+_FLOW_MINOR_RE = re.compile(r"^ {4}MINOR_VERSION\s*=\s*(\d+)", re.MULTILINE)
+
+_MIGRATION_MARKERS = {
+    # The component-level hook Home Assistant calls to move a config entry forward.
+    "config_entry": re.compile(rb"\basync_migrate_entry\b"),
+    # Bulk rewrites of entity unique ids. Plain async_update_entity is left out: renames
+    # and device classes use it far more often than migrations do.
+    "unique_id": re.compile(rb"\basync_migrate_entries\b|\basync_migrate_entity_entry\b"),
+}
+
+
+def config_entry_schema(config_flow_py: str) -> tuple[int, int]:
+    """The (VERSION, MINOR_VERSION) a config flow declares. Both default to 1."""
+    major = _FLOW_VERSION_RE.search(config_flow_py)
+    minor = _FLOW_MINOR_RE.search(config_flow_py)
+    return (int(major.group(1)) if major else 1, int(minor.group(1)) if minor else 1)
+
+
+def migration_markers(files: dict[str, bytes]) -> dict[str, bool]:
+    """Which kinds of migration code appear anywhere in a set of source files."""
+    blob = b"\n".join(files.values())
+    return {name: bool(rx.search(blob)) for name, rx in _MIGRATION_MARKERS.items()}
+
+
+# ---------------------------------------------------------------------------
 # Comparing a release against the running code
 #
 # A wheel is a zip, and a zip's central directory carries the CRC32 and size of
@@ -287,21 +327,34 @@ _CD_ENTRY_SIG = b"PK\x01\x02"
 _TAIL_BYTES = 1 << 20  # enough for the end-of-directory records plus any comment
 
 
-def parse_central_directory(data: bytes) -> dict[str, tuple[int, int]]:
-    """Map member name -> (crc32, uncompressed size) from raw central directory bytes.
+@dataclass
+class ZipEntry:
+    """One central directory record: enough to compare a file, or to go and read it."""
+
+    crc: int
+    size: int
+    compressed_size: int
+    method: int
+    offset: int  # where this member's local header starts in the archive
+
+
+def parse_central_directory(data: bytes) -> dict[str, ZipEntry]:
+    """Map member name -> ZipEntry from raw central directory bytes.
 
     Accepts a whole zip as well: parsing starts at the first entry signature.
     """
-    entries: dict[str, tuple[int, int]] = {}
+    entries: dict[str, ZipEntry] = {}
     pos = data.find(_CD_ENTRY_SIG)
     if pos < 0:
         return entries
     while pos + 46 <= len(data) and data[pos : pos + 4] == _CD_ENTRY_SIG:
-        crc, _compressed, size, name_len, extra_len, comment_len = struct.unpack(
+        method = struct.unpack("<H", data[pos + 10 : pos + 12])[0]
+        crc, compressed, size, name_len, extra_len, comment_len = struct.unpack(
             "<IIIHHH", data[pos + 16 : pos + 34]
         )
+        offset = struct.unpack("<I", data[pos + 42 : pos + 46])[0]
         name = data[pos + 46 : pos + 46 + name_len].decode("utf-8", "replace")
-        entries[name] = (crc, size)
+        entries[name] = ZipEntry(crc, size, compressed, method, offset)
         pos += 46 + name_len + extra_len + comment_len
     return entries
 
@@ -339,10 +392,10 @@ async def _fetch_range(session: aiohttp.ClientSession, url: str, start: int, end
     return data
 
 
-async def async_component_entries(
-    session: aiohttp.ClientSession, wheel: WheelInfo, domain: str
-) -> dict[str, tuple[int, int]]:
-    """Digest of homeassistant/components/<domain>/ inside a wheel, without downloading it."""
+async def async_central_directory(
+    session: aiohttp.ClientSession, wheel: WheelInfo
+) -> dict[str, ZipEntry]:
+    """Every member of a wheel, read from its index rather than its contents."""
     tail_start = max(0, wheel.size - _TAIL_BYTES)
     tail = await _fetch_range(session, wheel.url, tail_start, wheel.size - 1)
     offset, size = _locate_central_directory(tail, wheel.size)
@@ -351,13 +404,64 @@ async def async_component_entries(
         directory = tail[offset - tail_start : offset - tail_start + size]
     else:
         directory = await _fetch_range(session, wheel.url, offset, offset + size - 1)
+    return parse_central_directory(directory)
 
+
+def component_digest(entries: dict[str, ZipEntry], domain: str) -> dict[str, tuple[int, int]]:
+    """Narrow a wheel's index to one integration, in the shape comparisons use."""
     prefix = f"homeassistant/components/{domain}/"
     return {
-        name[len(prefix) :]: value
-        for name, value in parse_central_directory(directory).items()
+        name[len(prefix) :]: (entry.crc, entry.size)
+        for name, entry in entries.items()
         if name.startswith(prefix) and not name.endswith("/") and "__pycache__/" not in name
     }
+
+
+async def async_component_entries(
+    session: aiohttp.ClientSession, wheel: WheelInfo, domain: str
+) -> dict[str, tuple[int, int]]:
+    """Digest of homeassistant/components/<domain>/ inside a wheel, without downloading it."""
+    return component_digest(await async_central_directory(session, wheel), domain)
+
+
+async def async_read_member(
+    session: aiohttp.ClientSession, wheel: WheelInfo, entry: ZipEntry
+) -> bytes:
+    """Pull one file out of a wheel, using the offset its index recorded."""
+    header = await _fetch_range(session, wheel.url, entry.offset, entry.offset + 29)
+    # The local header repeats the name and may carry different extra bytes than the
+    # central directory did, so its own lengths are the ones that locate the data.
+    name_len, extra_len = struct.unpack("<HH", header[26:30])
+    start = entry.offset + 30 + name_len + extra_len
+    data = await _fetch_range(session, wheel.url, start, start + entry.compressed_size - 1)
+    if entry.method == 8:
+        return zlib.decompressobj(-zlib.MAX_WBITS).decompress(data)
+    return data
+
+
+async def async_read_entries(
+    session: aiohttp.ClientSession,
+    wheel: WheelInfo,
+    entries: dict[str, ZipEntry],
+    domain: str,
+    names: list[str],
+) -> dict[str, bytes]:
+    """Read named files of one integration from an already-parsed index."""
+    prefix = f"homeassistant/components/{domain}/"
+    found = {}
+    for name in names:
+        entry = entries.get(prefix + name)
+        if entry is not None:
+            found[name] = await async_read_member(session, wheel, entry)
+    return found
+
+
+async def async_read_wheel_files(
+    session: aiohttp.ClientSession, wheel: WheelInfo, domain: str, names: list[str]
+) -> dict[str, bytes]:
+    """Read named files of one integration out of a wheel. Missing names are skipped."""
+    entries = await async_central_directory(session, wheel)
+    return await async_read_entries(session, wheel, entries, domain, names)
 
 
 def digest_files(files: dict[str, bytes]) -> dict[str, tuple[int, int]]:

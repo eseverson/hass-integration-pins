@@ -32,6 +32,7 @@ FEATURES = (
     "git",
     "retired",
     "custom_integrations",
+    "migration",
 )
 
 # Where a pin's code came from.

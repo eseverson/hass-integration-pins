@@ -38,6 +38,10 @@ Each pin shows how its Python requirements differ from the bundled version's. If
 
 ## What can go wrong
 
+Take a backup first. This is a way out of a bad release, not a supported configuration: it can break an integration, your Home Assistant install or your database, and it comes with no warranty.
+
+Home Assistant stores a schema version on every config entry, and pinning across a change to it is the part that is not simply undone. The panel checks that before you commit — a pin that cannot load is refused unless you tick a box, and a pin whose code is *newer* than your stored entry is flagged because it rewrites that entry and unpinning does not put it back. What the check cannot see is everything else: entity unique ids the code rewrites at runtime, statistics whose unit or id changes, or anything already in the recorder database.
+
 Pinned code runs against a newer core than it was written for. Over one or two releases that is almost always fine, but it is not guaranteed — watch the log for deprecation warnings from `custom_components.<domain>`.
 
 Pins on integrations that others import from, such as `bluetooth`, `mqtt`, `zha`, `recorder` and `http`, are far riskier than pins on ordinary device integrations. The panel warns you but will not stop you.

@@ -55,6 +55,9 @@ class IntegrationPinsPanel extends HTMLElement {
     this._gitRef = "dev";
     this._fieldErrors = {}; // field name -> message, shown against the input itself
     this._resetting = false; // set for one render, to drop the values instead of keeping them
+    this._errorCode = null; // websocket error code of the last failed call
+    this._migrationBlocked = false; // the pin cannot read this instance's stored config entry
+    this._ackMigration = false;
     this._versions = [];
     this._released = {}; // version -> YYYY-MM-DD it shipped, for "changed since" links
     this._prereleases = false;
@@ -129,6 +132,7 @@ class IntegrationPinsPanel extends HTMLElement {
 
   async _call(msg, busyText) {
     this._error = null;
+    this._errorCode = null;
     this._notice = null;
     this._busy = busyText;
     this._render();
@@ -137,6 +141,7 @@ class IntegrationPinsPanel extends HTMLElement {
       return r;
     } catch (e) {
       this._error = e.message || String(e);
+      this._errorCode = e.code || null;
       return null;
     } finally {
       this._busy = null;
@@ -183,9 +188,14 @@ class IntegrationPinsPanel extends HTMLElement {
         ...chosen.payload,
         core_range: form.core_range.value.trim(),
         reason: form.reason.value.trim(),
+        acknowledge_migration: this._ackMigration,
       },
       chosen.busy
     );
+    if (!r && this._errorCode === "migration_blocked") {
+      this._migrationBlocked = true;
+      this._render();
+    }
     if (r) {
       this._notice = `Pinned ${chosen.domain} to ${r.pinned_version}. Restart Home Assistant to load it.`;
       this._resetAddForm();
@@ -202,6 +212,8 @@ class IntegrationPinsPanel extends HTMLElement {
     this._domainInfo = null;
     this._compare = null;
     this._fieldErrors = {};
+    this._migrationBlocked = false;
+    this._ackMigration = false;
     this._resetting = true;
     this._render();
   }
@@ -226,6 +238,7 @@ class IntegrationPinsPanel extends HTMLElement {
       `Reading the file list for ${chosen.label}…`
     );
     this._compare = r;
+    if (r) this._migrationBlocked = r.migration?.verdict === "blocked";
     this._render();
   }
 
@@ -373,7 +386,12 @@ class IntegrationPinsPanel extends HTMLElement {
   _paintDomainAids() {
     const box = this.shadowRoot.getElementById("form-messages");
     if (box) {
-      box.innerHTML = [this._sourceWarningHtml(), this._domainWarningHtml(), this._compareHtml()]
+      box.innerHTML = [
+        this._sourceWarningHtml(),
+        this._domainWarningHtml(),
+        this._migrationHtml(),
+        this._compareHtml(),
+      ]
         .filter(Boolean)
         .join("");
     }
@@ -394,6 +412,39 @@ class IntegrationPinsPanel extends HTMLElement {
     if (!this._fieldErrors[name]) return;
     delete this._fieldErrors[name];
     this._paintFieldErrors();
+  }
+
+  /* The one part of a pin that is not simply undone. Home Assistant stores a schema
+   * version on each config entry, and pinning across a change of it either fails to load
+   * or rewrites the entry for good. */
+  _migrationHtml() {
+    const c = this._compare;
+    const m = c?.migration;
+    if (!m) return "";
+    const stored = m.stored ? m.stored[0] : "?";
+    const code = m.code ? m.code[0] : "?";
+    const lines = {
+      blocked: `<strong>${esc(c.domain)}</strong> has a config entry stored at version ${stored}, and this
+        code expects version ${code} with no way to migrate back. Home Assistant will refuse to set it up.`,
+      downgrade: `<strong>${esc(c.domain)}</strong> has a config entry stored at version ${stored} and this
+        code expects version ${code}. Its migration is written to move entries forward, so being handed a
+        newer one will most likely fail.`,
+      forward: `This code expects config entry version ${code}, above the ${stored} stored here, so pinning it
+        rewrites your config entry. <strong>Unpinning does not undo that</strong> — the bundled code would
+        then be older than the entry and may refuse to load.`,
+      minor: `A minor config entry migration will run (version ${stored} to ${code}).`,
+    }[m.verdict];
+    const uid = m.unique_id_migration
+      ? `<div>This code ${lines ? "also " : ""}migrates entity unique ids. Whether it rewrites anything
+         depends on your existing entities.</div>`
+      : "";
+    if (!lines && !uid) return "";
+    const severe = ["blocked", "downgrade", "forward"].includes(m.verdict);
+    return `
+      <div class="${severe ? "warn-box" : "info-box"}">
+        <ha-icon icon="${severe ? "mdi:database-alert" : "mdi:database-sync"}"></ha-icon>
+        <div>${lines ? `<div>${lines}</div>` : ""}${uid}</div>
+      </div>`;
   }
 
   _sourceWarningHtml() {
@@ -448,6 +499,8 @@ class IntegrationPinsPanel extends HTMLElement {
     const domain = ev.target.value.trim().toLowerCase();
     if (this._compare && this._compare.domain !== domain) {
       this._compare = null;
+      this._migrationBlocked = false;
+      this._ackMigration = false;
     }
     if (this._domainInfo && this._domainInfo.domain !== domain) {
       this._domainInfo = null;
@@ -529,6 +582,8 @@ class IntegrationPinsPanel extends HTMLElement {
         if (btn.dataset.source === this._source) return;
         this._source = btn.dataset.source;
         this._compare = null;
+        this._migrationBlocked = false;
+        this._ackMigration = false;
         this._fieldErrors = {};
         return this._render();
       }
@@ -561,8 +616,13 @@ class IntegrationPinsPanel extends HTMLElement {
     }
     if (ev.target.name === "version") {
       if (this._compare) this._compare = null;
+      this._migrationBlocked = false;
+      this._ackMigration = false;
       this._clearFieldError("version");
       this._paintDomainAids();
+    }
+    if (ev.target.name === "acknowledge_migration") {
+      this._ackMigration = ev.target.checked;
     }
     if (ev.target.name === "only_in_use") {
       this._onlyInUse = ev.target.checked;
@@ -763,6 +823,11 @@ class IntegrationPinsPanel extends HTMLElement {
             <div class="form-actions">
               <ha-button type="submit" raised ${this._busy ? "disabled" : ""}>Pin</ha-button>
               <ha-button data-action="compare" ${this._busy ? "disabled" : ""}>Compare with running code</ha-button>
+              ${this._migrationBlocked ? `
+                <label class="ack small">
+                  <input type="checkbox" name="acknowledge_migration" ${this._ackMigration ? "checked" : ""}>
+                  pin it anyway, knowing it may not load
+                </label>` : ""}
             </div>
             <div id="form-messages" class="span-all"></div>
           </form>
@@ -949,7 +1014,8 @@ class IntegrationPinsPanel extends HTMLElement {
       .inline-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; padding: 12px; background: var(--secondary-background-color); border-radius: 8px; }
       .inline-form .muted, .form-actions, .span-all { grid-column: 1 / -1; }
       .span-all:empty { display: none; }
-      .form-actions { display: flex; gap: 8px; }
+      .form-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .ack { display: flex; align-items: center; gap: 6px; color: var(--error-color, #db4437); }
       ha-button.danger { --mdc-theme-primary: var(--error-color); }
       @media (max-width: 800px) {
         .table, .table.cols-3 { grid-template-columns: 1fr 1fr; }
