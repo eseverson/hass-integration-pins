@@ -4,9 +4,9 @@ Run one core integration's code from a different Home Assistant release, without
 
 When a release breaks an integration the usual choices are to live with it or roll back the whole install. This adds a third: pick the integration and the release you want its code from, and everything else keeps running the current core.
 
-![The Integration Pins panel](docs/panel.png)
-
 Nothing changes automatically on upgrade. Each pin carries a "valid for core" range; when the running core leaves that range you get a Repair warning, and the pinned code keeps running until you decide what to do.
+
+![The Integration Pins panel](docs/panel.png)
 
 ## Install
 
