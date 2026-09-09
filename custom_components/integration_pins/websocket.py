@@ -44,6 +44,7 @@ def async_register(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_core_domains)
     websocket_api.async_register_command(hass, ws_domain_info)
     websocket_api.async_register_command(hass, ws_versions)
+    websocket_api.async_register_command(hass, ws_compare)
     websocket_api.async_register_command(hass, ws_pin)
     websocket_api.async_register_command(hass, ws_adopt)
     websocket_api.async_register_command(hass, ws_update)
@@ -216,3 +217,19 @@ async def ws_delete_retired(hass, connection, msg: dict[str, Any]) -> None:
 async def ws_clear_retired(hass, connection, msg: dict[str, Any]) -> None:
     removed = await _manager(hass).async_clear_retired()
     connection.send_result(msg["id"], {"removed": removed})
+
+
+@websocket_api.require_admin
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/compare",
+        vol.Required("domain"): str,
+        vol.Required("version"): str,
+    }
+)
+@websocket_api.async_response
+@_wrap
+async def ws_compare(hass, connection, msg: dict[str, Any]) -> None:
+    connection.send_result(
+        msg["id"], await _manager(hass).async_compare(msg["domain"], msg["version"])
+    )

@@ -21,7 +21,7 @@ from custom_components.integration_pins.const import (
     RETIRED_DIRNAME,
 )
 
-from .conftest import FAKE_DOMAIN, FAKE_VERSION
+from .conftest import FAKE_DOMAIN, FAKE_VERSION, build_fake_wheel
 
 
 @pytest.fixture
@@ -316,8 +316,6 @@ async def test_pin_becomes_active_once_the_override_is_the_running_code(
 async def test_repinning_to_another_release_is_pending_again(
     hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
 ):
-    from .conftest import build_fake_wheel
-
     _mock_pypi(aioclient_mock, fake_wheel)
     newer = "2026.1.0"
     _mock_pypi(aioclient_mock, build_fake_wheel(tmp_path, version=newer), version=newer)
@@ -544,3 +542,98 @@ async def test_clear_retired_empties_the_folder(
     assert (await client.receive_json())["success"]
 
     assert list(root.iterdir()) == []
+
+
+def test_parse_central_directory_matches_the_zip_it_came_from(tmp_path):
+    import zipfile
+
+    wheel = build_fake_wheel(tmp_path)
+    with zipfile.ZipFile(wheel) as zf:
+        expected = {i.filename: (i.CRC, i.file_size) for i in zf.infolist()}
+
+    entries = pinner.parse_central_directory(wheel.read_bytes())
+
+    assert entries == expected
+
+
+def test_local_component_digest_skips_bytecode(tmp_path):
+    import zlib
+
+    src = tmp_path / "sun"
+    (src / "__pycache__").mkdir(parents=True)
+    (src / "__init__.py").write_bytes(b"hello")
+    (src / "__pycache__" / "x.pyc").write_bytes(b"junk")
+
+    digest = pinner.local_component_digest(src)
+
+    assert digest == {"__init__.py": (zlib.crc32(b"hello"), 5)}
+
+
+def test_compare_digests_splits_added_removed_and_changed():
+    base = {"a.py": (1, 10), "gone.py": (2, 20), "same.py": (3, 30)}
+    candidate = {"a.py": (9, 11), "new.py": (4, 40), "same.py": (3, 30)}
+
+    result = pinner.compare_digests(base, candidate)
+
+    assert result == {
+        "added": ["new.py"],
+        "removed": ["gone.py"],
+        "changed": ["a.py"],
+        "unchanged": 1,
+    }
+
+
+async def test_compare_reports_differences_against_the_running_core(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel
+):
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    result = (await client.receive_json())["result"]
+
+    assert result["identical"] is False
+    assert result["compared_with"] == f"core {CORE_VERSION}"
+    assert "manifest.json" in result["changed"]
+    # Bytecode is not part of either side.
+    assert not any("__pycache__" in name for name in result["added"] + result["removed"])
+
+
+async def test_compare_uses_the_pinned_release_as_the_baseline(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
+):
+    """The on-disk override carries a marker and an injected manifest version, so the
+    honest baseline for an existing pypi pin is the release it came from."""
+    newer = "2026.1.0"
+    _mock_pypi(aioclient_mock, fake_wheel)
+    _mock_pypi(aioclient_mock, build_fake_wheel(tmp_path, version=newer), version=newer)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    assert (await client.receive_json())["success"]
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "version": newer}
+    )
+    result = (await client.receive_json())["result"]
+
+    assert result["compared_with"] == f"pinned {FAKE_VERSION}"
+    assert result["changed"] == ["__init__.py"]  # only the docstring names the release
+    assert result["added"] == [] and result["removed"] == []
+
+
+async def test_compare_rejects_a_release_without_that_integration(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel
+):
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": "hue", "version": FAKE_VERSION}
+    )
+    msg = await client.receive_json()
+
+    assert not msg["success"] and "has no core integration 'hue'" in msg["error"]["message"]

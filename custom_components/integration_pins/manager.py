@@ -17,6 +17,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from . import pinner
 from .const import (
     DOMAIN,
+    MARKER_FILE,
     ISSUE_FOREIGN,
     ISSUE_MISSING,
     ISSUE_OUT_OF_RANGE,
@@ -138,6 +139,61 @@ class PinManager:
             "dependents": dependents,
             "loaded_dependents": [d for d in dependents if d in in_use],
         }
+
+    async def async_compare(self, domain: str, version: str) -> dict[str, Any]:
+        """Which files of an integration differ between a release and the running code."""
+        domain = domain.strip().lower()
+        version = version.strip()
+        pinner.parse_version(version)
+        session = async_get_clientsession(self.hass)
+
+        wheel = await pinner.async_get_wheel(session, version)
+        candidate = await pinner.async_component_entries(session, wheel, domain)
+        if not candidate:
+            raise PinError(f"Home Assistant {version} has no core integration '{domain}'")
+
+        base, compared_with = await self._async_baseline(domain, session)
+        result = pinner.compare_digests(base, candidate)
+        return {
+            **result,
+            "domain": domain,
+            "version": version,
+            "compared_with": compared_with,
+            "identical": not (result["added"] or result["removed"] or result["changed"]),
+        }
+
+    async def _async_baseline(
+        self, domain: str, session: Any
+    ) -> tuple[dict[str, tuple[int, int]], str]:
+        """The digest of whatever code this instance is running for `domain`, and its name."""
+        config_dir = self.hass.config.config_dir
+        info = await self.hass.async_add_executor_job(pinner.inspect_override, domain, config_dir)
+        pin = self.store.get(domain)
+        marker = info.get("marker") or {}
+
+        if (
+            info.get("present")
+            and pin is not None
+            and pin.source == "pypi"
+            and marker.get("pinned_version") == pin.pinned_version
+        ):
+            # The override on disk was extracted from a release, but pinning rewrote its
+            # manifest and added a marker; that release's own wheel is the honest baseline.
+            base_wheel = await pinner.async_get_wheel(session, pin.pinned_version)
+            entries = await pinner.async_component_entries(session, base_wheel, domain)
+            if entries:
+                return entries, f"pinned {pin.pinned_version}"
+
+        if info.get("present"):
+            path = pinner.custom_components_dir(config_dir) / domain
+            digest = await self.hass.async_add_executor_job(
+                pinner.local_component_digest, path, {MARKER_FILE}
+            )
+            return digest, f"custom_components/{domain}"
+
+        path = pinner.core_components_dir() / domain
+        digest = await self.hass.async_add_executor_job(pinner.local_component_digest, path)
+        return digest, f"core {CORE_VERSION}"
 
     async def async_versions(self, include_prereleases: bool) -> list[str]:
         session = async_get_clientsession(self.hass)

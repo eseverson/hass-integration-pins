@@ -43,6 +43,7 @@ class IntegrationPinsPanel extends HTMLElement {
     this._onlyInUse = true;
     this._domainInfo = null; // dependency info for the domain currently typed in
     this._domainInfoTimer = null;
+    this._compare = null; // result of the last "Compare" against the running code
     this._versions = [];
     this._prereleases = false;
     this._busy = null; // text shown while a long operation runs
@@ -163,6 +164,50 @@ class IntegrationPinsPanel extends HTMLElement {
     this._render();
   }
 
+  async _runCompare() {
+    const form = this.shadowRoot.querySelector("#add-form");
+    const domain = form?.domain.value.trim().toLowerCase();
+    const version = form?.version.value;
+    if (!domain || !version) {
+      this._error = "Pick an integration and a release first.";
+      return this._render();
+    }
+    const r = await this._call(
+      { type: "integration_pins/compare", domain, version },
+      `Reading ${version}'s file list…`
+    );
+    this._compare = r;
+    this._render();
+  }
+
+  _compareHtml() {
+    const c = this._compare;
+    if (!c) return "";
+    if (c.identical) {
+      return `
+        <div class="ok-box">
+          <ha-icon icon="mdi:check-circle-outline"></ha-icon>
+          <div><strong>${esc(c.domain)}</strong> in ${esc(c.version)} is byte-identical to
+          ${esc(c.compared_with)}. Pinning it would change nothing.</div>
+        </div>`;
+    }
+    const total = c.added.length + c.removed.length + c.changed.length;
+    const list = (label, names) => names.length
+      ? `<div><span class="muted">${label}</span> <span class="mono small">${esc(names.slice(0, 12).join(", "))}${names.length > 12 ? `, +${names.length - 12} more` : ""}</span></div>`
+      : "";
+    return `
+      <div class="info-box">
+        <ha-icon icon="mdi:file-compare"></ha-icon>
+        <div>
+          <div><strong>${total}</strong> file${total === 1 ? "" : "s"} differ between
+          ${esc(c.version)} and ${esc(c.compared_with)} (${c.unchanged} unchanged).</div>
+          ${list("changed:", c.changed)}
+          ${list("only in " + c.version + ":", c.added)}
+          ${list("only in " + c.compared_with + ":", c.removed)}
+        </div>
+      </div>`;
+  }
+
   async _deleteRetired(name) {
     if (!confirm(`Delete ${name}?\n\nThis removes the retired copy from disk for good.`)) return;
     await this._call({ type: "integration_pins/delete_retired", name }, `Deleting ${name}…`);
@@ -261,6 +306,12 @@ class IntegrationPinsPanel extends HTMLElement {
       if (f && saved.version && f.version) f.version.value = saved.version;
     }
     this._paintDomainWarning();
+    this._paintCompare();
+  }
+
+  _paintCompare() {
+    const box = this.shadowRoot.getElementById("compare-result");
+    if (box) box.innerHTML = this._compareHtml();
   }
 
   /* Written straight into the DOM rather than through _render(): the domain field is
@@ -273,6 +324,10 @@ class IntegrationPinsPanel extends HTMLElement {
   _onInput(ev) {
     if (ev.target.name !== "domain") return;
     const domain = ev.target.value.trim().toLowerCase();
+    if (this._compare && this._compare.domain !== domain) {
+      this._compare = null;
+      this._paintCompare();
+    }
     clearTimeout(this._domainInfoTimer);
     this._domainInfoTimer = setTimeout(() => this._loadDomainInfo(domain), 250);
   }
@@ -344,6 +399,8 @@ class IntegrationPinsPanel extends HTMLElement {
         return this._deleteRetired(btn.dataset.name);
       case "clear-retired":
         return this._clearRetired();
+      case "compare":
+        return this._runCompare();
       case "restart":
         return this._restart();
       case "refresh":
@@ -368,6 +425,10 @@ class IntegrationPinsPanel extends HTMLElement {
     if (ev.target.name === "prereleases") {
       this._prereleases = ev.target.checked;
       this._loadVersions();
+    }
+    if (ev.target.name === "version" && this._compare) {
+      this._compare = null;
+      this._render();
     }
     if (ev.target.name === "only_in_use") {
       this._onlyInUse = ev.target.checked;
@@ -507,11 +568,13 @@ class IntegrationPinsPanel extends HTMLElement {
               <span class="small"><input type="checkbox" name="only_in_use" ${this._onlyInUse ? "checked" : ""}> only integrations in use (${this._inUseDomains.length} of ${this._domains.length})</span>
             </label>
             <div id="domain-warning" class="span-all"></div>
+            <div id="compare-result" class="span-all"></div>
             <label>Take code from release
               <select name="version" required class="mono">
                 <option value="">${this._versions.length ? "select…" : "loading from PyPI…"}</option>${opts}
               </select>
               <span class="small"><input type="checkbox" name="prereleases" ${this._prereleases ? "checked" : ""}> include betas</span>
+              <ha-button data-action="compare" ${this._busy ? "disabled" : ""}>Compare with running code</ha-button>
             </label>
             <label>Valid for core
               <input name="core_range" value="==${esc(snap.core_version)}" class="mono">
@@ -659,6 +722,12 @@ class IntegrationPinsPanel extends HTMLElement {
       .warn-box { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 8px;
         background: rgba(255,152,0,.12); border: 1px solid rgba(255,152,0,.4); font-size: 0.92em; }
       .warn-box ha-icon { color: var(--warning-color, #ff9800); flex: none; }
+      .ok-box, .info-box { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px;
+        border-radius: 8px; font-size: 0.92em; }
+      .ok-box { background: rgba(67,160,71,.12); border: 1px solid rgba(67,160,71,.4); }
+      .ok-box ha-icon { color: var(--success-color, #43a047); flex: none; }
+      .info-box { background: var(--secondary-background-color); border: 1px solid var(--divider-color); }
+      .info-box ha-icon { color: var(--secondary-text-color); flex: none; }
       .chip.hacs { background: rgba(3,155,229,.18); color: var(--info-color, #039be5); }
       .chip.pending { background: rgba(3,155,229,.2); color: var(--info-color, #039be5); }
       .chip.out_of_range { background: rgba(255,152,0,.2); color: var(--warning-color, #ff9800); }

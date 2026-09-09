@@ -11,8 +11,10 @@ import json
 import logging
 import os
 import shutil
+import struct
 import tempfile
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -129,6 +131,129 @@ async def async_download(session: aiohttp.ClientSession, wheel: WheelInfo, dest:
     if wheel.sha256 and digest.hexdigest() != wheel.sha256:
         dest.unlink(missing_ok=True)
         raise PinError("Downloaded wheel failed sha256 verification")
+
+
+# ---------------------------------------------------------------------------
+# Comparing a release against the running code
+#
+# A wheel is a zip, and a zip's central directory carries the CRC32 and size of
+# every member. Range-fetching that directory -- under a tenth of the file -- is
+# enough to say exactly which files of an integration differ, without pulling the
+# 50 MB body. pip extracts wheel members verbatim, so the CRC32 of an installed
+# core file equals the one recorded in the wheel it came from.
+# ---------------------------------------------------------------------------
+
+_EOCD_SIG = b"PK\x05\x06"
+_ZIP64_EOCD_SIG = b"PK\x06\x06"
+_CD_ENTRY_SIG = b"PK\x01\x02"
+_TAIL_BYTES = 1 << 20  # enough for the end-of-directory records plus any comment
+
+
+def parse_central_directory(data: bytes) -> dict[str, tuple[int, int]]:
+    """Map member name -> (crc32, uncompressed size) from raw central directory bytes.
+
+    Accepts a whole zip as well: parsing starts at the first entry signature.
+    """
+    entries: dict[str, tuple[int, int]] = {}
+    pos = data.find(_CD_ENTRY_SIG)
+    if pos < 0:
+        return entries
+    while pos + 46 <= len(data) and data[pos : pos + 4] == _CD_ENTRY_SIG:
+        crc, _compressed, size, name_len, extra_len, comment_len = struct.unpack(
+            "<IIIHHH", data[pos + 16 : pos + 34]
+        )
+        name = data[pos + 46 : pos + 46 + name_len].decode("utf-8", "replace")
+        entries[name] = (crc, size)
+        pos += 46 + name_len + extra_len + comment_len
+    return entries
+
+
+def _locate_central_directory(tail: bytes, total_size: int) -> tuple[int, int]:
+    """Return (offset, size) of the central directory, reading the end-of-archive records."""
+    eocd = tail.rfind(_EOCD_SIG)
+    if eocd < 0:
+        raise PinError("Wheel is not a readable zip archive")
+    cd_size, cd_offset = struct.unpack("<II", tail[eocd + 12 : eocd + 20])
+
+    # Zip64 archives park the real values in a separate record and leave 0xFFFF.. here.
+    if cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
+        zip64 = tail.rfind(_ZIP64_EOCD_SIG)
+        if zip64 < 0:
+            raise PinError("Wheel needs a zip64 directory that is not present")
+        cd_size, cd_offset = struct.unpack("<QQ", tail[zip64 + 40 : zip64 + 56])
+
+    if cd_offset + cd_size > total_size:
+        raise PinError("Wheel central directory is out of bounds")
+    return cd_offset, cd_size
+
+
+async def _fetch_range(session: aiohttp.ClientSession, url: str, start: int, end: int) -> bytes:
+    """Return bytes [start, end] of a URL, tolerating a server that ignores Range."""
+    async with session.get(
+        url, headers={"Range": f"bytes={start}-{end}"}, timeout=aiohttp.ClientTimeout(total=120)
+    ) as resp:
+        status = resp.status
+        if status not in (200, 206):
+            raise PinError(f"Range request failed with HTTP {status}")
+        data = await resp.read()
+    if status == 200 and len(data) > end - start + 1:
+        return data[start : end + 1]
+    return data
+
+
+async def async_component_entries(
+    session: aiohttp.ClientSession, wheel: WheelInfo, domain: str
+) -> dict[str, tuple[int, int]]:
+    """Digest of homeassistant/components/<domain>/ inside a wheel, without downloading it."""
+    tail_start = max(0, wheel.size - _TAIL_BYTES)
+    tail = await _fetch_range(session, wheel.url, tail_start, wheel.size - 1)
+    offset, size = _locate_central_directory(tail, wheel.size)
+
+    if offset >= tail_start:
+        directory = tail[offset - tail_start : offset - tail_start + size]
+    else:
+        directory = await _fetch_range(session, wheel.url, offset, offset + size - 1)
+
+    prefix = f"homeassistant/components/{domain}/"
+    return {
+        name[len(prefix) :]: value
+        for name, value in parse_central_directory(directory).items()
+        if name.startswith(prefix) and not name.endswith("/") and "__pycache__/" not in name
+    }
+
+
+def local_component_digest(path: Path, ignore: set[str] | None = None) -> dict[str, tuple[int, int]]:
+    """Same digest shape, computed over an integration directory on disk."""
+    ignore = ignore or set()
+    digest: dict[str, tuple[int, int]] = {}
+    for file in path.rglob("*"):
+        if not file.is_file() or "__pycache__" in file.parts:
+            continue
+        rel = file.relative_to(path).as_posix()
+        if rel in ignore:
+            continue
+        try:
+            data = file.read_bytes()
+        except OSError:
+            continue
+        digest[rel] = (zlib.crc32(data), len(data))
+    return digest
+
+
+def compare_digests(
+    base: dict[str, tuple[int, int]], candidate: dict[str, tuple[int, int]]
+) -> dict[str, Any]:
+    """What the candidate changes relative to the base."""
+    added = sorted(set(candidate) - set(base))
+    removed = sorted(set(base) - set(candidate))
+    shared = set(base) & set(candidate)
+    changed = sorted(name for name in shared if base[name] != candidate[name])
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "unchanged": len(shared) - len(changed),
+    }
 
 
 # ---------------------------------------------------------------------------
