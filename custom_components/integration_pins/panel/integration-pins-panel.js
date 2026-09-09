@@ -681,7 +681,8 @@ class IntegrationPinsPanel extends HTMLElement {
       <ha-card header="Pin an integration">
         <div class="card-content">
           <form id="add-form" data-form="add" class="grid-form">
-            <label>Integration domain
+            <label>
+              <span class="label-row">Integration domain</span>
               <span class="control">
                 <input name="domain" list="core-domains" placeholder="e.g. hue" autocomplete="off" class="mono">
                 <span class="field-error" data-for="domain" hidden></span>
@@ -690,13 +691,13 @@ class IntegrationPinsPanel extends HTMLElement {
               <span class="small"><input type="checkbox" name="only_in_use" ${this._onlyInUse ? "checked" : ""}> only integrations in use (${this._inUseDomains.length} of ${this._domains.length})</span>
               <div id="domain-links" class="small"></div>
             </label>
-            <label>Take code from
-              ${canGit ? `
+            <label>
+              <span class="label-row">Take code from${canGit ? `
                 <span class="segmented">
                   <button type="button" data-action="source" data-source="release" class="${git ? "" : "on"}">a release</button>
                   <button type="button" data-action="source" data-source="git" class="${git ? "on" : ""}">git</button>
-                </span>
-              ` : ""}
+                </span>` : ""}
+              </span>
               ${git ? `
                 <span class="control">
                   <input name="git_ref" value="${esc(this._gitRef)}" placeholder="dev" autocomplete="off" class="mono">
@@ -713,10 +714,12 @@ class IntegrationPinsPanel extends HTMLElement {
                 <span class="small"><input type="checkbox" name="prereleases" ${this._prereleases ? "checked" : ""}> include betas</span>
               `}
             </label>
-            <label>Valid for core
+            <label>
+              <span class="label-row">Valid for core</span>
               <input name="core_range" value="==${esc(snap.core_version)}" class="mono">
             </label>
-            <label class="grow">Reason
+            <label class="grow">
+              <span class="label-row">Reason</span>
               <input name="reason" placeholder="what broke, link to the issue…">
             </label>
             <div class="form-actions">
@@ -865,8 +868,10 @@ class IntegrationPinsPanel extends HTMLElement {
       .chip { padding: 2px 10px; border-radius: 12px; font-size: 0.8em; font-weight: 500; white-space: nowrap; }
       .chip.active { background: rgba(67,160,71,.2); color: var(--success-color, #43a047); }
       #domain-links:empty { display: none; }
-      .segmented { display: inline-flex; align-self: flex-start; border: 1px solid var(--divider-color); border-radius: 6px; overflow: hidden; }
-      .segmented button { font: inherit; font-size: 0.9em; padding: 5px 12px; border: 0; cursor: pointer;
+      .grid-form > label > .label-row { display: flex; align-items: center; justify-content: space-between;
+        gap: 8px; min-height: 26px; }
+      .segmented { display: inline-flex; flex: none; border: 1px solid var(--divider-color); border-radius: 6px; overflow: hidden; }
+      .segmented button { font: inherit; font-size: 0.85em; line-height: 1.5; padding: 2px 10px; border: 0; cursor: pointer;
         background: var(--card-background-color); color: var(--secondary-text-color); }
       .segmented button.on { background: var(--primary-color); color: var(--text-primary-color, #fff); }
       .control { position: relative; display: block; }
