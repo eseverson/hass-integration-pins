@@ -20,6 +20,20 @@ MARKER_FILE = ".integration_pin.json"
 # Where unpinned override directories are moved (relative to the config dir).
 RETIRED_DIRNAME = "integration_pins_retired"
 
+# What this backend understands. The panel is served with no-cache and so updates on a
+# browser reload, while these Python modules only change when Home Assistant restarts --
+# a panel newer than its backend must be able to notice rather than send a request the
+# older websocket schema rejects. Add a name here whenever the panel starts depending on
+# something the previous version could not do.
+FEATURES = (
+    "in_use",
+    "domain_info",
+    "compare",
+    "git",
+    "retired",
+    "custom_integrations",
+)
+
 # Where a pin's code came from.
 SOURCE_PYPI = "pypi"  # extracted from a release wheel
 SOURCE_GIT = "git"  # fetched from a commit in the core repository

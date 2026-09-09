@@ -4,6 +4,13 @@
  * matches the active theme.
  */
 
+/* What this build of the panel needs from the backend. The panel is served with
+ * no-cache, so a browser reload picks up a new one immediately -- but the Python behind
+ * it only changes when Home Assistant restarts. Anything the running backend does not
+ * advertise is hidden, and the page says why, instead of sending a request its older
+ * websocket schema would reject with a validation error. */
+const PANEL_FEATURES = ["in_use", "domain_info", "compare", "git", "retired", "custom_integrations"];
+
 const STATUS_LABEL = {
   active: "Active",
   pending: "Pending restart",
@@ -139,7 +146,8 @@ class IntegrationPinsPanel extends HTMLElement {
    * the offending field when something is missing, so the message lands on the input
    * rather than in a banner at the top of the page. */
   _formSource(form) {
-    const git = this._source === "git";
+    const canGit = this._backendHas("git");
+    const git = canGit && this._source === "git";
     const domain = (form?.domain?.value || "").trim().toLowerCase();
     const ref = (form?.git_ref?.value || "").trim();
     const version = (form?.version?.value || "").trim();
@@ -362,7 +370,7 @@ class IntegrationPinsPanel extends HTMLElement {
   }
 
   _sourceWarningHtml() {
-    if (this._source !== "git") return "";
+    if (this._source !== "git" || !this._backendHas("git")) return "";
     return `
       <div class="warn-box">
         <ha-icon icon="mdi:source-branch"></ha-icon>
@@ -538,6 +546,13 @@ class IntegrationPinsPanel extends HTMLElement {
             <ha-button data-action="refresh" ${this._busy ? "disabled" : ""}>Re-check</ha-button>
           </div>
         </div>
+        ${this._staleBackend().length ? `
+          <div class="alert warning">
+            <ha-icon icon="mdi:update"></ha-icon>
+            <span>This panel has updated, but Home Assistant is still running the previous
+            integration code. Anything newer than that is hidden until you restart.</span>
+            <ha-button data-action="restart">Restart now</ha-button>
+          </div>` : ""}
         ${snap.restart_required ? `
           <div class="alert warning">
             <ha-icon icon="mdi:restart-alert"></ha-icon>
@@ -559,6 +574,15 @@ class IntegrationPinsPanel extends HTMLElement {
           code keeps running until you act.
         </p>
       </div>`;
+  }
+
+  _backendHas(feature) {
+    return (this._snapshot?.features || []).includes(feature);
+  }
+
+  _staleBackend() {
+    if (!this._snapshot) return [];
+    return PANEL_FEATURES.filter((f) => !this._backendHas(f));
   }
 
   _banners() {
@@ -651,7 +675,8 @@ class IntegrationPinsPanel extends HTMLElement {
   _addCard(snap) {
     const opts = this._versions.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
     const domains = this._onlyInUse && this._inUseDomains.length ? this._inUseDomains : this._domains;
-    const git = this._source === "git";
+    const canGit = this._backendHas("git");
+    const git = canGit && this._source === "git";
     return `
       <ha-card header="Pin an integration">
         <div class="card-content">
@@ -666,10 +691,12 @@ class IntegrationPinsPanel extends HTMLElement {
               <div id="domain-links" class="small"></div>
             </label>
             <label>Take code from
-              <span class="segmented">
-                <button type="button" data-action="source" data-source="release" class="${git ? "" : "on"}">a release</button>
-                <button type="button" data-action="source" data-source="git" class="${git ? "on" : ""}">git</button>
-              </span>
+              ${canGit ? `
+                <span class="segmented">
+                  <button type="button" data-action="source" data-source="release" class="${git ? "" : "on"}">a release</button>
+                  <button type="button" data-action="source" data-source="git" class="${git ? "on" : ""}">git</button>
+                </span>
+              ` : ""}
               ${git ? `
                 <span class="control">
                   <input name="git_ref" value="${esc(this._gitRef)}" placeholder="dev" autocomplete="off" class="mono">

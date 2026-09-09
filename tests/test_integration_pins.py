@@ -963,3 +963,19 @@ async def test_unmanaged_override_reports_where_it_came_from(
     assert override["domain"] == "plant"
     assert override["source"] == "hacs"
     assert override["source_detail"] == "Olen/homeassistant-plant"
+
+
+async def test_snapshot_advertises_what_this_backend_can_do(
+    hass: HomeAssistant, setup, hass_ws_client
+):
+    """The panel updates on a browser reload; Python only on a restart. The panel needs
+    to be able to tell it is talking to an older backend."""
+    from custom_components.integration_pins.const import FEATURES
+
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    snap = (await client.receive_json())["result"]
+
+    assert snap["features"] == list(FEATURES)
+    assert "git" in snap["features"]

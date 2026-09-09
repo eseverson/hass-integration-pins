@@ -17,6 +17,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from . import pinner
 from .const import (
     DOMAIN,
+    FEATURES,
     MARKER_FILE,
     SOURCE_GIT,
     SOURCE_PYPI,
@@ -101,6 +102,7 @@ class PinManager:
         retired = await self.hass.async_add_executor_job(pinner.list_retired, config_dir)
         return {
             "core_version": CORE_VERSION,
+            "features": list(FEATURES),
             "restart_required": self._removal_pending
             or any(p["status"] == STATUS_PENDING for p in pins),
             "pins": pins,

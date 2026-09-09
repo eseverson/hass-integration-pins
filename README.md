@@ -66,6 +66,6 @@ uv pip install homeassistant pytest-homeassistant-custom-component "home-assista
 pytest
 ```
 
-The panel is served with `Cache-Control: no-cache` and its URL is keyed to a hash of the file, so editing `panel/integration-pins-panel.js` and reloading the browser is enough — no restart, no hard reload.
+The panel is served with `Cache-Control: no-cache` and its URL is keyed to a hash of the file, so editing `panel/integration-pins-panel.js` and reloading the browser is enough — no restart, no hard reload. Python is not so lucky: `websocket.py` and the rest only change when Home Assistant restarts, so a panel reload can leave you newer on the frontend than on the backend. The backend advertises what it understands in `const.FEATURES`, and the panel hides anything the running one does not list and says a restart is needed, rather than sending a request the older websocket schema rejects. Add a name to `FEATURES` whenever the panel starts depending on something the previous version could not do.
 
 The tests exercise the full pin → pending → out-of-range → unpin flow through the websocket API with a fake wheel served from an aiohttp mock; the panel was additionally checked in a browser against a live instance pinning a real integration from a real PyPI wheel. The release comparison was checked against real wheels on PyPI: the same release reports byte-identical, an older one reports the files that actually changed.
