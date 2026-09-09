@@ -637,3 +637,49 @@ async def test_compare_rejects_a_release_without_that_integration(
     msg = await client.receive_json()
 
     assert not msg["success"] and "has no core integration 'hue'" in msg["error"]["message"]
+
+
+def test_module_url_changes_when_the_panel_file_changes(tmp_path):
+    from custom_components.integration_pins import _module_url
+    from custom_components.integration_pins.const import PANEL_JS_FILE, PANEL_STATIC_URL
+
+    panel = tmp_path / PANEL_JS_FILE
+    panel.write_text("console.log(1)")
+    first = _module_url("0.1.0", panel)
+    panel.write_text("console.log(2)")
+    second = _module_url("0.1.0", panel)
+
+    assert first.startswith(f"{PANEL_STATIC_URL}/{PANEL_JS_FILE}?v=0.1.0-")
+    assert first != second
+
+
+async def test_panel_module_is_served_with_revalidation(hass: HomeAssistant, setup, hass_client):
+    """No Cache-Control at all leaves browsers free to serve a stale panel."""
+    from custom_components.integration_pins.const import PANEL_JS_FILE, PANEL_STATIC_URL
+
+    client = await hass_client()
+
+    resp = await client.get(f"{PANEL_STATIC_URL}/{PANEL_JS_FILE}")
+
+    assert resp.status == 200
+    assert resp.headers["Cache-Control"] == "no-cache"
+    assert "IntegrationPinsPanel" in await resp.text()
+
+
+async def test_unchanged_panel_revalidates_to_an_empty_304(
+    hass: HomeAssistant, setup, hass_client
+):
+    """no-cache costs a round trip, not a re-download."""
+    from custom_components.integration_pins.const import PANEL_JS_FILE, PANEL_STATIC_URL
+
+    client = await hass_client()
+    url = f"{PANEL_STATIC_URL}/{PANEL_JS_FILE}"
+    first = await client.get(url)
+    validator = first.headers.get("ETag") or first.headers.get("Last-Modified")
+    assert validator, "nothing for the browser to revalidate against"
+    header = "If-None-Match" if first.headers.get("ETag") else "If-Modified-Since"
+
+    second = await client.get(url, headers={header: validator})
+
+    assert second.status == 304
+    assert await second.read() == b""

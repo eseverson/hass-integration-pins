@@ -62,4 +62,6 @@ uv pip install homeassistant pytest-homeassistant-custom-component "home-assista
 pytest
 ```
 
+The panel is served with `Cache-Control: no-cache` and its URL is keyed to a hash of the file, so editing `panel/integration-pins-panel.js` and reloading the browser is enough — no restart, no hard reload.
+
 The tests exercise the full pin → pending → out-of-range → unpin flow through the websocket API with a fake wheel served from an aiohttp mock; the panel was additionally checked in a browser against a live instance pinning a real integration from a real PyPI wheel. The release comparison was checked against real wheels on PyPI: the same release reports byte-identical, an older one reports the files that actually changed.
