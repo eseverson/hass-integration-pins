@@ -745,7 +745,7 @@ class IntegrationPinsPanel extends HTMLElement {
       .form-actions { display: flex; gap: 8px; }
       ha-button.danger { --mdc-theme-primary: var(--error-color); }
       @media (max-width: 800px) {
-        .table { grid-template-columns: 1fr 1fr; }
+        .table, .table.cols-3 { grid-template-columns: 1fr 1fr; }
         .thead { display: none; }
         .row > .cell { border-top: none; }
         .row > .cell:first-child { border-top: 1px solid var(--divider-color); grid-column: 1 / -1; }
