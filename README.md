@@ -2,6 +2,10 @@
 
 Run one core integration's code from a different Home Assistant release, without downgrading the rest.
 
+> **Integration Pins is not affiliated with, endorsed, recommended, or supported by the Home Assistant project.**
+>
+> This custom integration is provided as-is, without any warranty. It runs integration code the release you are on was never tested with, which can break that integration, your Home Assistant install, or your database.
+
 When a release breaks an integration the usual choices are to live with it or roll back the whole install. This adds a third: pick the integration and the release you want its code from, and everything else keeps running the current core.
 
 Nothing changes automatically on upgrade. Each pin carries a "valid for core" range; when the running core leaves that range you get a Repair warning, and the pinned code keeps running until you decide what to do.
@@ -38,7 +42,7 @@ Each pin shows how its Python requirements differ from the bundled version's. If
 
 ## What can go wrong
 
-Take a backup first. This is a way out of a bad release, not a supported configuration: it can break an integration, your Home Assistant install or your database, and it comes with no warranty.
+Take a backup first. This is a way out of a bad release, not something to leave in place indefinitely.
 
 Home Assistant stores a schema version on every config entry, and pinning across a change to it is the part that is not simply undone. The panel checks that before you commit — a pin that cannot load is refused unless you tick a box, and a pin whose code is *newer* than your stored entry is flagged because it rewrites that entry and unpinning does not put it back. What the check cannot see is everything else: entity unique ids the code rewrites at runtime, statistics whose unit or id changes, or anything already in the recorder database.
 
