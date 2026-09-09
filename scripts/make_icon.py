@@ -16,7 +16,9 @@ SIZE = 1024  # drawn large and downscaled, which is what keeps the edges clean
 BLUE = (3, 169, 244, 255)
 WHITE = (255, 255, 255, 255)
 GLYPH_SCALE = 0.62  # how much of the tile the pin occupies
-OUT = Path(__file__).resolve().parent.parent / "brand"
+# HACS looks for the asset inside the integration, not at the repository root:
+# https://github.com/hacs/integration/blob/main/custom_components/hacs/validate/brands.py
+OUT = Path(__file__).resolve().parent.parent / "custom_components" / "integration_pins" / "brand"
 
 # mdi:pin, viewBox 0 0 24 24. Every segment is a straight line, so the path is a
 # plain polygon: https://raw.githubusercontent.com/Templarian/MaterialDesign/master/svg/pin.svg
