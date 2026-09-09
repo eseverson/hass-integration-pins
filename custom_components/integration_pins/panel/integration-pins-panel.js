@@ -601,16 +601,16 @@ class IntegrationPinsPanel extends HTMLElement {
                 <option value="">${this._versions.length ? "select…" : "loading from PyPI…"}</option>${opts}
               </select>
               <span class="small"><input type="checkbox" name="prereleases" ${this._prereleases ? "checked" : ""}> include betas</span>
-              <ha-button data-action="compare" ${this._busy ? "disabled" : ""}>Compare with running code</ha-button>
             </label>
             <label>Valid for core
               <input name="core_range" value="==${esc(snap.core_version)}" class="mono">
             </label>
-            <label>Reason
+            <label class="grow">Reason
               <input name="reason" placeholder="what broke, link to the issue…">
             </label>
             <div class="form-actions">
               <ha-button type="submit" raised ${this._busy ? "disabled" : ""}>Pin</ha-button>
+              <ha-button data-action="compare" ${this._busy ? "disabled" : ""}>Compare with running code</ha-button>
             </div>
             <div id="compare-result" class="span-all"></div>
           </form>
@@ -769,7 +769,10 @@ class IntegrationPinsPanel extends HTMLElement {
       form label { display: flex; flex-direction: column; gap: 4px; font-size: 0.9em; color: var(--secondary-text-color); }
       input, select { font: inherit; color: var(--primary-text-color); background: var(--card-background-color); border: 1px solid var(--divider-color); border-radius: 6px; padding: 8px; }
       input[type=checkbox] { padding: 0; }
-      .grid-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; align-items: start; margin-bottom: 8px; }
+      .grid-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; margin-bottom: 8px; }
+      .grid-form > label { flex: 1 1 200px; min-width: 0; }
+      .grid-form > label.grow { flex: 3 1 240px; }
+      .grid-form > .form-actions, .grid-form > .span-all { flex: 1 1 100%; }
       .inline-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px; padding: 12px; background: var(--secondary-background-color); border-radius: 8px; }
       .inline-form .muted, .form-actions, .span-all { grid-column: 1 / -1; }
       .span-all:empty { display: none; }
