@@ -26,7 +26,7 @@ The panel appears in the sidebar for admin users. It needs outbound HTTPS to `py
 
 When other integrations are built on the one you picked, the form says how many depend on it and which of those are loaded here.
 
-**Valid for core** is a PEP 440 specifier set: `==2026.9.1` (the default — only the core you are on now), `~=2026.9.0` for any 2026.9.x, `>=2026.9.0,<2026.11.0` for a window, empty for any. Outside its range a pin shows **Out of range** and raises a Repair warning; widen the range if you have checked the pinned code still works, or unpin. A new pin shows **Pending restart** until Home Assistant has loaded it.
+**Valid for core** is a version range: `==2026.9.1` (the default — only the core you are on now), `~=2026.9.0` for any 2026.9.x, `>=2026.9.0,<2026.11.0` for a window, empty for any. Outside its range a pin shows **Out of range** and raises a Repair warning; widen the range if you have checked the pinned code still works, or unpin. A new pin shows **Pending restart** until Home Assistant has loaded it.
 
 **Edit** changes the range or reason. **Unpin** removes the override; restart to go back to the bundled integration. **Re-pin** appears if the override goes missing or is replaced.
 

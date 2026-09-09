@@ -706,7 +706,7 @@ class IntegrationPinsPanel extends HTMLElement {
           <ha-button type="submit" ${this._busy ? "disabled" : ""}>Save</ha-button>
           <ha-button data-action="cancel-edit">Cancel</ha-button>
         </div>
-        <div class="muted small">Range syntax is PEP 440: <code>==2026.9.1</code>, <code>~=2026.9.0</code> (any 2026.9.x), <code>&gt;=2026.9.0,&lt;2026.11.0</code>. Leave empty for any.</div>
+        <div class="muted small">Range examples: <code>==2026.9.1</code> (that release only), <code>~=2026.9.0</code> (any 2026.9.x), <code>&gt;=2026.9.0,&lt;2026.11.0</code> (a window). Leave empty for any.</div>
       </form>`;
   }
 
