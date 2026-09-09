@@ -305,8 +305,30 @@ class IntegrationPinsPanel extends HTMLElement {
       for (const [k, v] of Object.entries(saved)) if (f && f[k] && f[k].value === "" && k !== "version") f[k].value = v;
       if (f && saved.version && f.version) f.version.value = saved.version;
     }
-    this._paintDomainWarning();
+    this._paintDomainAids();
     this._paintCompare();
+  }
+
+  _paintDomainAids() {
+    this._paintDomainWarning();
+    const links = this.shadowRoot.getElementById("domain-links");
+    if (links) links.innerHTML = this._domainLinksHtml();
+  }
+
+  /* The upstream history is the fastest way to see what changed in an integration:
+   * `latest` puts the commits made since your release at the top, and the tag link
+   * shows the code as it stood in the release you are about to pin. */
+  _domainLinksHtml() {
+    const info = this._domainInfo;
+    if (!info) return "";
+    const base = "https://github.com/home-assistant/core/commits";
+    const path = `homeassistant/components/${encodeURIComponent(info.domain)}`;
+    const link = (ref, text) =>
+      `<a href="${base}/${encodeURIComponent(ref)}/${path}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`;
+    const version = this.shadowRoot.querySelector("#add-form")?.version?.value;
+    return `<span class="muted">history:</span> ${link("dev", "latest")}${
+      version ? ` · ${link(version, `at ${version}`)}` : ""
+    }`;
   }
 
   _paintCompare() {
@@ -328,6 +350,10 @@ class IntegrationPinsPanel extends HTMLElement {
       this._compare = null;
       this._paintCompare();
     }
+    if (this._domainInfo && this._domainInfo.domain !== domain) {
+      this._domainInfo = null;
+      this._paintDomainAids();
+    }
     clearTimeout(this._domainInfoTimer);
     this._domainInfoTimer = setTimeout(() => this._loadDomainInfo(domain), 250);
   }
@@ -335,7 +361,7 @@ class IntegrationPinsPanel extends HTMLElement {
   async _loadDomainInfo(domain) {
     if (!domain || !this._domains.includes(domain)) {
       this._domainInfo = null;
-      this._paintDomainWarning();
+      this._paintDomainAids();
       return;
     }
     try {
@@ -343,7 +369,7 @@ class IntegrationPinsPanel extends HTMLElement {
     } catch (e) {
       this._domainInfo = null;
     }
-    this._paintDomainWarning();
+    this._paintDomainAids();
   }
 
   _domainWarningHtml() {
@@ -426,9 +452,10 @@ class IntegrationPinsPanel extends HTMLElement {
       this._prereleases = ev.target.checked;
       this._loadVersions();
     }
-    if (ev.target.name === "version" && this._compare) {
-      this._compare = null;
-      this._render();
+    if (ev.target.name === "version") {
+      if (this._compare) this._compare = null;
+      this._paintDomainAids();
+      this._paintCompare();
     }
     if (ev.target.name === "only_in_use") {
       this._onlyInUse = ev.target.checked;
@@ -566,9 +593,9 @@ class IntegrationPinsPanel extends HTMLElement {
               <input name="domain" list="core-domains" placeholder="e.g. hue" required autocomplete="off" class="mono">
               <datalist id="core-domains">${domains.map((d) => `<option value="${esc(d)}">`).join("")}</datalist>
               <span class="small"><input type="checkbox" name="only_in_use" ${this._onlyInUse ? "checked" : ""}> only integrations in use (${this._inUseDomains.length} of ${this._domains.length})</span>
+              <div id="domain-links" class="small"></div>
             </label>
             <div id="domain-warning" class="span-all"></div>
-            <div id="compare-result" class="span-all"></div>
             <label>Take code from release
               <select name="version" required class="mono">
                 <option value="">${this._versions.length ? "select…" : "loading from PyPI…"}</option>${opts}
@@ -585,6 +612,7 @@ class IntegrationPinsPanel extends HTMLElement {
             <div class="form-actions">
               <ha-button type="submit" raised ${this._busy ? "disabled" : ""}>Pin</ha-button>
             </div>
+            <div id="compare-result" class="span-all"></div>
           </form>
           <div class="muted small">
             Tip: pick the last release where the integration worked. The default range is only the core you are
@@ -719,6 +747,9 @@ class IntegrationPinsPanel extends HTMLElement {
       .actions { justify-content: flex-end; }
       .chip { padding: 2px 10px; border-radius: 12px; font-size: 0.8em; font-weight: 500; white-space: nowrap; }
       .chip.active { background: rgba(67,160,71,.2); color: var(--success-color, #43a047); }
+      #domain-links:empty { display: none; }
+      #domain-links a { color: var(--primary-color); text-decoration: none; }
+      #domain-links a:hover { text-decoration: underline; }
       .warn-box { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 8px;
         background: rgba(255,152,0,.12); border: 1px solid rgba(255,152,0,.4); font-size: 0.92em; }
       .warn-box ha-icon { color: var(--warning-color, #ff9800); flex: none; }
