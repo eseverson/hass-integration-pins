@@ -1,5 +1,8 @@
 {
   "name": "Integration Pins",
   "homeassistant": "2026.2.3",
-  "render_readme": true
+  "render_readme": true,
+  "zip_release": true,
+  "filename": "integration_pins.zip",
+  "hide_default_branch": true
 }
