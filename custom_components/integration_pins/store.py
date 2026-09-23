@@ -22,10 +22,11 @@ class Pin:
     reason: str = ""
     created: str = field(default_factory=lambda: dt_util.utcnow().isoformat())
     core_at_pin: str = ""  # core version that was running when the pin was made
-    source: str = "pypi"  # "pypi", "git" or "adopted"
+    source: str = "pypi"  # "pypi", "git", "upload" or "adopted"
     git_ref: str = ""  # branch, tag or commit that was asked for
     git_sha: str = ""  # commit it resolved to
     git_repo: str = GITHUB_REPO  # owner/name the commit came from
+    upload_label: str = ""  # name of the folder an uploaded pin came from
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

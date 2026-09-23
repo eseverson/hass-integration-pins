@@ -131,6 +131,7 @@ async def ws_versions(hass, connection, msg: dict[str, Any]) -> None:
         vol.Optional("version", default=""): str,
         vol.Optional("git_ref", default=""): str,
         vol.Optional("git_repo", default=GITHUB_REPO): str,
+        vol.Optional("upload_id", default=""): str,
         vol.Optional("core_range", default=""): str,
         vol.Optional("reason", default=""): str,
         vol.Optional("acknowledge_migration", default=False): bool,
@@ -147,6 +148,7 @@ async def ws_pin(hass, connection, msg: dict[str, Any]) -> None:
         msg["git_ref"],
         msg["acknowledge_migration"],
         git_repo=msg["git_repo"],
+        upload_id=msg["upload_id"],
     )
     connection.send_result(msg["id"], pin.as_dict())
 
@@ -240,6 +242,7 @@ async def ws_clear_retired(hass, connection, msg: dict[str, Any]) -> None:
         vol.Optional("version", default=""): str,
         vol.Optional("git_ref", default=""): str,
         vol.Optional("git_repo", default=GITHUB_REPO): str,
+        vol.Optional("upload_id", default=""): str,
     }
 )
 @websocket_api.async_response
@@ -248,6 +251,10 @@ async def ws_compare(hass, connection, msg: dict[str, Any]) -> None:
     connection.send_result(
         msg["id"],
         await _manager(hass).async_compare(
-            msg["domain"], msg["version"], msg["git_ref"], msg["git_repo"]
+            msg["domain"],
+            msg["version"],
+            msg["git_ref"],
+            msg["git_repo"],
+            upload_id=msg["upload_id"],
         ),
     )

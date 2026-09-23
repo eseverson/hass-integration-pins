@@ -14,7 +14,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from . import pinner
+from . import pinner, uploads
 from .const import (
     DOMAIN,
     FEATURES,
@@ -22,6 +22,7 @@ from .const import (
     MARKER_FILE,
     SOURCE_GIT,
     SOURCE_PYPI,
+    SOURCE_UPLOAD,
     ISSUE_FOREIGN,
     ISSUE_MISSING,
     ISSUE_OUT_OF_RANGE,
@@ -43,6 +44,13 @@ SIGNAL_UPDATED = f"{DOMAIN}_updated"
 MIGRATION_FILES = ["config_flow.py", "__init__.py"]
 
 
+def _one_source(version: str, git_ref: str, upload_id: str) -> None:
+    if sum(bool(s) for s in (version, git_ref, upload_id)) != 1:
+        raise PinError(
+            "Take the code from exactly one of a release, a git ref or an uploaded folder"
+        )
+
+
 class PinManager:
     """Single instance stored in hass.data[DOMAIN]."""
 
@@ -53,6 +61,7 @@ class PinManager:
         self._removal_pending = False
         self._dependents: dict[str, list[str]] | None = None
         self._lock = asyncio.Lock()
+        self.uploads = uploads.UploadStaging()
         self._listeners: list[callback] = []
 
     # -- lifecycle -----------------------------------------------------------
@@ -150,17 +159,29 @@ class PinManager:
         }
 
     async def async_compare(
-        self, domain: str, version: str = "", git_ref: str = "", git_repo: str = GITHUB_REPO
+        self,
+        domain: str,
+        version: str = "",
+        git_ref: str = "",
+        git_repo: str = GITHUB_REPO,
+        upload_id: str = "",
     ) -> dict[str, Any]:
         """Which files of an integration differ between a candidate and the running code."""
         domain = domain.strip().lower()
         version = version.strip()
         git_ref = git_ref.strip()
-        if bool(version) == bool(git_ref):
-            raise PinError("Compare against either a release or a git ref, not both")
+        upload_id = upload_id.strip()
+        _one_source(version, git_ref, upload_id)
         session = async_get_clientsession(self.hass)
 
-        if git_ref:
+        if upload_id:
+            upload = self._upload_for(upload_id, domain)
+            files = upload.files
+            candidate = pinner.digest_files(files)
+            probe = {name: files[name] for name in MIGRATION_FILES if name in files}
+            label = f"upload {upload.label}"
+            since = ""
+        elif git_ref:
             source = await pinner.async_resolve_git_source(session, git_ref, git_repo)
             files = await pinner.async_git_component(session, source, domain)
             candidate = pinner.digest_files(files)
@@ -192,6 +213,24 @@ class PinManager:
             "migration": self.async_migration_check(domain, probe),
             "identical": not (result["added"] or result["removed"] or result["changed"]),
         }
+
+    @callback
+    def async_stage_upload(
+        self, domain: str, label: str, files: dict[str, bytes]
+    ) -> dict[str, Any]:
+        """Hold an uploaded directory until it is compared and pinned."""
+        domain = domain.strip().lower()
+        uploads.validate_upload(domain, files)
+        version = uploads.content_version(CORE_VERSION, files)
+        upload_id = self.uploads.add(uploads.Upload(domain, label or domain, files, version))
+        _LOGGER.info("Staged %d uploaded files from %s for %s", len(files), label, domain)
+        return {"upload_id": upload_id, "domain": domain, "files": len(files), "version": version}
+
+    def _upload_for(self, upload_id: str, domain: str) -> uploads.Upload:
+        upload = self.uploads.get(upload_id)
+        if upload.domain != domain:
+            raise PinError(f"That upload is the '{upload.domain}' integration, not '{domain}'")
+        return upload
 
     async def _async_baseline(
         self, domain: str, session: Any
@@ -315,12 +354,13 @@ class PinManager:
         git_ref: str = "",
         acknowledge_migration: bool = False,
         git_repo: str = GITHUB_REPO,
+        upload_id: str = "",
     ) -> Pin:
         domain = domain.strip().lower()
         version = version.strip()
         git_ref = git_ref.strip()
-        if bool(version) == bool(git_ref):
-            raise PinError("Take the code from either a release or a git ref, not both")
+        upload_id = upload_id.strip()
+        _one_source(version, git_ref, upload_id)
         pinner.parse_range(core_range)
         if domain == DOMAIN:
             raise PinError("Refusing to pin integration_pins itself")
@@ -333,21 +373,28 @@ class PinManager:
                 )
             existing = self.store.get(domain)
             session = async_get_clientsession(self.hass)
-            if git_ref:
+            if upload_id:
+                pinned_version, provenance = await self._async_install_from_upload(
+                    domain, upload_id, acknowledge_migration
+                )
+                source = SOURCE_UPLOAD
+            elif git_ref:
                 pinned_version, provenance = await self._async_install_from_git(
                     domain, git_ref, session, acknowledge_migration, git_repo
                 )
+                source = SOURCE_GIT
             else:
                 pinned_version, provenance = await self._async_install_from_release(
                     domain, version, session, acknowledge_migration
                 )
+                source = SOURCE_PYPI
             pin = Pin(
                 domain=domain,
                 pinned_version=pinned_version,
                 core_range=core_range.strip(),
                 reason=reason.strip(),
                 core_at_pin=CORE_VERSION,
-                source=SOURCE_GIT if git_ref else SOURCE_PYPI,
+                source=source,
                 created=existing.created if existing else Pin.__dataclass_fields__["created"].default_factory(),
                 **provenance,
             )
@@ -419,6 +466,27 @@ class PinManager:
         )
         return source.version, provenance
 
+    async def _async_install_from_upload(
+        self, domain: str, upload_id: str, acknowledged: bool = False
+    ) -> tuple[str, dict[str, str]]:
+        upload = self._upload_for(upload_id, domain)
+        self._guard_migration(domain, upload.files, acknowledged)
+        _LOGGER.info(
+            "Pinning %s to uploaded folder %s (%d files)", domain, upload.label, len(upload.files)
+        )
+        provenance = {"upload_label": upload.label}
+        await self.hass.async_add_executor_job(
+            pinner.install_component,
+            upload.files,
+            domain,
+            upload.version,
+            self.hass.config.config_dir,
+            CORE_VERSION,
+            provenance,
+        )
+        self.uploads.discard(upload_id)
+        return upload.version, provenance
+
     async def async_adopt(
         self, domain: str, pinned_version: str, core_range: str, reason: str
     ) -> Pin:
@@ -464,8 +532,8 @@ class PinManager:
             raise PinError(f"No pin for '{domain}'")
         async with self._lock:
             if not keep_files:
-                # A pypi pin records the release it came from, so the files can always be
-                # fetched again; an adopted one was placed by hand and exists nowhere else.
+                # PyPI and git pins record where they came from, so the files can be fetched
+                # again; adopted and uploaded ones exist nowhere else.
                 keep_a_copy = pin.source not in (SOURCE_PYPI, SOURCE_GIT)
                 retired = await self.hass.async_add_executor_job(
                     pinner.remove_override,

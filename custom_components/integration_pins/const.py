@@ -36,12 +36,14 @@ FEATURES = (
     "custom_integrations",
     "migration",
     "git_repo",
+    "upload",
 )
 
 # Where a pin's code came from.
 SOURCE_PYPI = "pypi"  # extracted from a release wheel
 SOURCE_GIT = "git"  # fetched from a commit in the core repository
 SOURCE_ADOPTED = "adopted"  # a directory that was already there
+SOURCE_UPLOAD = "upload"  # a folder uploaded from the browser
 
 # Git pins come from core or from a fork of it laid out the same way.
 GITHUB_REPO = "home-assistant/core"

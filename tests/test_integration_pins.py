@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import aiohttp
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -997,6 +998,7 @@ async def test_snapshot_advertises_what_this_backend_can_do(
     assert snap["features"] == list(FEATURES)
     assert "git" in snap["features"]
     assert "git_repo" in snap["features"]
+    assert "upload" in snap["features"]
 
 
 async def test_version_listing_carries_release_dates(
@@ -1465,3 +1467,281 @@ def test_a_pin_stored_before_forks_loads_as_a_core_pin():
     )
 
     assert pin.git_repo == CORE_REPO
+
+
+# -- uploads ---------------------------------------------------------------------
+
+UPLOAD_URL = "/api/integration_pins/upload"
+UPLOADED = {
+    "__init__.py": b"my local fix",
+    "manifest.json": b'{"domain": "sun", "requirements": []}',
+    "translations/en.json": b"{}",
+}
+
+
+def _upload_form(domain, files, label="sun"):
+    form = aiohttp.FormData()
+    form.add_field("domain", domain)
+    form.add_field("label", label)
+    for path, data in files.items():
+        form.add_field(
+            f"f:{path}",
+            data,
+            filename=path.rsplit("/", 1)[-1],
+            content_type="application/octet-stream",
+        )
+    return form
+
+
+async def _upload(hass_client, domain=FAKE_DOMAIN, files=UPLOADED, token=None):
+    client = await (hass_client() if token is None else hass_client(token))
+    return await client.post(UPLOAD_URL, data=_upload_form(domain, files))
+
+
+async def _staged(hass_client, **kwargs) -> dict:
+    resp = await _upload(hass_client, **kwargs)
+    assert resp.status == 200, await resp.text()
+    return await resp.json()
+
+
+async def test_uploading_a_folder_stages_it_without_writing_anything(
+    hass: HomeAssistant, setup, hass_client, tmp_path
+):
+    staged = await _staged(hass_client)
+
+    assert staged["domain"] == FAKE_DOMAIN
+    assert staged["files"] == 3
+    assert staged["version"].startswith(f"{CORE_VERSION}+local.")
+    assert len(staged["version"].rsplit(".", 1)[-1]) == 7
+    assert not (tmp_path / "custom_components" / FAKE_DOMAIN).exists()
+
+
+async def test_upload_version_follows_the_content(hass: HomeAssistant, setup, hass_client):
+    first = await _staged(hass_client)
+    same = await _staged(hass_client)
+    other = await _staged(hass_client, files={**UPLOADED, "__init__.py": b"another fix"})
+
+    assert first["version"] == same["version"] != other["version"]
+    assert first["upload_id"] != same["upload_id"]
+
+
+async def test_upload_drops_bytecode(hass: HomeAssistant, setup, hass_client):
+    staged = await _staged(
+        hass_client,
+        files={**UPLOADED, "__pycache__/x.cpython-313.pyc": b"junk", "stray.pyc": b"junk"},
+    )
+
+    assert staged["files"] == 3
+
+
+async def test_upload_requires_an_admin(
+    hass: HomeAssistant, setup, hass_client, hass_read_only_access_token
+):
+    resp = await _upload(hass_client, token=hass_read_only_access_token)
+
+    assert resp.status == 401
+
+
+@pytest.mark.parametrize(
+    ("domain", "files", "message"),
+    [
+        ("hue", UPLOADED, "'sun' integration, not 'hue'"),
+        (FAKE_DOMAIN, {"__init__.py": b"x"}, "no manifest.json"),
+        (FAKE_DOMAIN, {**UPLOADED, "manifest.json": b"{not json"}, "not valid JSON"),
+        (FAKE_DOMAIN, {**UPLOADED, "../evil.py": b"x"}, "outside"),
+        (FAKE_DOMAIN, {**UPLOADED, "/etc/evil.py": b"x"}, "outside"),
+        (FAKE_DOMAIN, {**UPLOADED, "a\\evil.py": b"x"}, "outside"),
+        ("", UPLOADED, "No integration domain"),
+    ],
+    ids=["domain_mismatch", "no_manifest", "bad_manifest", "dotdot", "absolute", "backslash", "no_domain"],
+)
+async def test_upload_is_refused(
+    hass: HomeAssistant, setup, hass_client, tmp_path, domain, files, message
+):
+    resp = await _upload(hass_client, domain=domain, files=files)
+
+    assert resp.status == 400
+    assert message in (await resp.json())["message"]
+    assert not (tmp_path.parent / "evil.py").exists()
+
+
+async def test_upload_of_too_many_files_points_at_the_checkout(
+    hass: HomeAssistant, setup, hass_client, monkeypatch
+):
+    from custom_components.integration_pins import uploads
+
+    monkeypatch.setattr(uploads, "MAX_FILES", 2)
+
+    resp = await _upload(hass_client)
+
+    assert resp.status == 400
+    assert "not the whole checkout" in (await resp.json())["message"]
+
+
+async def test_upload_over_the_size_limit_is_refused(
+    hass: HomeAssistant, setup, hass_client, monkeypatch
+):
+    from custom_components.integration_pins import uploads
+
+    monkeypatch.setattr(uploads, "MAX_BYTES", 16)
+
+    resp = await _upload(hass_client)
+
+    assert resp.status == 400
+    assert "larger than" in (await resp.json())["message"]
+
+
+def _an_upload():
+    from custom_components.integration_pins import uploads
+
+    return uploads.Upload(domain="sun", label="sun", files=dict(UPLOADED), version="1+local.x")
+
+
+def test_staged_uploads_expire_and_the_oldest_is_evicted():
+    from custom_components.integration_pins import uploads
+
+    now = [0.0]
+    staging = uploads.UploadStaging(clock=lambda: now[0])
+
+    first = staging.add(_an_upload())
+    now[0] = uploads.UPLOAD_TTL + 1
+    with pytest.raises(pinner.PinError, match="That upload has expired; pick the folder again"):
+        staging.get(first)
+
+    ids = [staging.add(_an_upload()) for _ in range(uploads.MAX_UPLOADS + 1)]
+    with pytest.raises(pinner.PinError, match="expired"):
+        staging.get(ids[0])
+    assert staging.get(ids[-1]).domain == "sun"
+
+
+async def test_compare_against_an_uploaded_folder(
+    hass: HomeAssistant, setup, hass_client, hass_ws_client
+):
+    staged = await _staged(hass_client)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "upload_id": staged["upload_id"]}
+    )
+    result = (await client.receive_json())["result"]
+
+    assert result["version"] == "upload sun"
+    assert result["compared_with"] == f"core {CORE_VERSION}"
+    assert "__init__.py" in result["changed"]
+    assert result["identical"] is False
+
+
+async def test_uploading_the_running_code_compares_identical(
+    hass: HomeAssistant, setup, hass_client, hass_ws_client
+):
+    root = pinner.core_components_dir() / FAKE_DOMAIN
+    files = {
+        str(p.relative_to(root)): p.read_bytes()
+        for p in root.rglob("*")
+        if p.is_file() and "__pycache__" not in p.parts
+    }
+    staged = await _staged(hass_client, files=files)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "upload_id": staged["upload_id"]}
+    )
+
+    assert (await client.receive_json())["result"]["identical"] is True
+
+
+async def test_pinning_an_uploaded_folder(
+    hass: HomeAssistant, setup, hass_client, hass_ws_client, tmp_path
+):
+    staged = await _staged(hass_client)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "upload_id": staged["upload_id"]}
+    )
+    pin = (await client.receive_json())["result"]
+
+    override = tmp_path / "custom_components" / FAKE_DOMAIN
+    assert (override / "__init__.py").read_bytes() == b"my local fix"
+    assert (override / "translations" / "en.json").is_file()
+    assert json.loads((override / "manifest.json").read_text())["version"] == staged["version"]
+    assert json.loads((override / MARKER_FILE).read_text())["upload_label"] == "sun"
+    assert pin["source"] == "upload"
+    assert pin["upload_label"] == "sun"
+    assert pin["pinned_version"] == staged["version"]
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    (listed,) = (await client.receive_json())["result"]["pins"]
+    assert listed["status"] == "pending"
+
+    # Pinning consumed the staged copy.
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "upload_id": staged["upload_id"]}
+    )
+    again = await client.receive_json()
+    assert not again["success"] and "expired" in again["error"]["message"]
+
+
+async def test_pinning_an_unknown_upload_is_refused(hass: HomeAssistant, setup, hass_ws_client):
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "upload_id": "gone"}
+    )
+    msg = await client.receive_json()
+
+    assert not msg["success"] and msg["error"]["code"] == "pin_error"
+    assert "pick the folder again" in msg["error"]["message"]
+
+
+async def test_an_upload_cannot_be_pinned_under_another_domain(
+    hass: HomeAssistant, setup, hass_client, hass_ws_client
+):
+    staged = await _staged(hass_client)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": "hue", "upload_id": staged["upload_id"]}
+    )
+    msg = await client.receive_json()
+
+    assert not msg["success"]
+    assert "'sun'" in msg["error"]["message"] and "'hue'" in msg["error"]["message"]
+
+
+async def test_pin_takes_exactly_one_source(
+    hass: HomeAssistant, setup, hass_client, hass_ws_client
+):
+    staged = await _staged(hass_client)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {
+            "type": f"{DOMAIN}/pin",
+            "domain": FAKE_DOMAIN,
+            "version": "2025.1.0",
+            "upload_id": staged["upload_id"],
+        }
+    )
+    msg = await client.receive_json()
+
+    assert not msg["success"] and msg["error"]["code"] == "pin_error"
+
+
+async def test_unpinning_an_upload_retires_it(
+    hass: HomeAssistant, setup, hass_client, hass_ws_client, tmp_path
+):
+    """An uploaded folder exists nowhere Home Assistant can fetch it from again."""
+    staged = await _staged(hass_client)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "upload_id": staged["upload_id"]}
+    )
+    assert (await client.receive_json())["success"]
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": FAKE_DOMAIN})
+    assert (await client.receive_json())["success"]
+
+    retired = list((tmp_path / RETIRED_DIRNAME).iterdir())
+    assert len(retired) == 1 and retired[0].name.startswith(f"{FAKE_DOMAIN}-")
+    assert (retired[0] / "__init__.py").read_bytes() == b"my local fix"

@@ -31,6 +31,7 @@ from .const import (
     PANEL_WEBCOMPONENT,
 )
 from .manager import PinManager
+from .uploads import UploadView
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -89,6 +90,7 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
     panel_js = Path(__file__).parent / "panel" / PANEL_JS_FILE
     if not hass.data.get(_DATA_STATIC_REGISTERED):
         hass.http.register_view(PanelModuleView(panel_js))
+        hass.http.register_view(UploadView())
         hass.data[_DATA_STATIC_REGISTERED] = True
 
     from homeassistant.loader import async_get_integration
