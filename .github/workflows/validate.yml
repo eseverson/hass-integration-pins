@@ -19,6 +19,9 @@ permissions:
 jobs:
   hacs:
     name: HACS
+    # HACS validates the GitHub repository named by GITHUB_REPOSITORY, so it only means
+    # anything on the GitHub mirror.
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -28,6 +31,8 @@ jobs:
 
   hassfest:
     name: Hassfest
+    # The action shells out to `docker run`, which the Forgejo runner does not provide.
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
