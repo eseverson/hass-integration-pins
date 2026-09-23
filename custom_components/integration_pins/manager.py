@@ -18,6 +18,7 @@ from . import pinner
 from .const import (
     DOMAIN,
     FEATURES,
+    GITHUB_REPO,
     MARKER_FILE,
     SOURCE_GIT,
     SOURCE_PYPI,
@@ -149,7 +150,7 @@ class PinManager:
         }
 
     async def async_compare(
-        self, domain: str, version: str = "", git_ref: str = ""
+        self, domain: str, version: str = "", git_ref: str = "", git_repo: str = GITHUB_REPO
     ) -> dict[str, Any]:
         """Which files of an integration differ between a candidate and the running code."""
         domain = domain.strip().lower()
@@ -160,11 +161,12 @@ class PinManager:
         session = async_get_clientsession(self.hass)
 
         if git_ref:
-            source = await pinner.async_resolve_git_source(session, git_ref)
+            source = await pinner.async_resolve_git_source(session, git_ref, git_repo)
             files = await pinner.async_git_component(session, source, domain)
             candidate = pinner.digest_files(files)
             probe = {name: files[name] for name in MIGRATION_FILES if name in files}
-            label = f"{source.ref} @ {source.sha[:7]}"
+            ref = source.ref if source.repo == GITHUB_REPO else f"{source.repo}@{source.ref}"
+            label = f"{ref} @ {source.sha[:7]}"
             since = source.date
         else:
             pinner.parse_version(version)
@@ -213,7 +215,9 @@ class PinManager:
             if entries:
                 return entries, f"pinned {pin.pinned_version}"
         if managed and pin.source == SOURCE_GIT and pin.git_sha:
-            source = pinner.GitSource(pin.git_ref, pin.git_sha, pin.core_at_pin)
+            source = pinner.GitSource(
+                pin.git_ref, pin.git_sha, pin.core_at_pin, repo=pin.git_repo
+            )
             files = await pinner.async_git_component(session, source, domain)
             return pinner.digest_files(files), f"pinned {pin.pinned_version}"
 
@@ -310,6 +314,7 @@ class PinManager:
         reason: str = "",
         git_ref: str = "",
         acknowledge_migration: bool = False,
+        git_repo: str = GITHUB_REPO,
     ) -> Pin:
         domain = domain.strip().lower()
         version = version.strip()
@@ -330,7 +335,7 @@ class PinManager:
             session = async_get_clientsession(self.hass)
             if git_ref:
                 pinned_version, provenance = await self._async_install_from_git(
-                    domain, git_ref, session, acknowledge_migration
+                    domain, git_ref, session, acknowledge_migration, git_repo
                 )
             else:
                 pinned_version, provenance = await self._async_install_from_release(
@@ -383,20 +388,26 @@ class PinManager:
         return version, {}
 
     async def _async_install_from_git(
-        self, domain: str, git_ref: str, session: Any, acknowledged: bool = False
+        self,
+        domain: str,
+        git_ref: str,
+        session: Any,
+        acknowledged: bool = False,
+        git_repo: str = GITHUB_REPO,
     ) -> tuple[str, dict[str, str]]:
-        source = await pinner.async_resolve_git_source(session, git_ref)
+        source = await pinner.async_resolve_git_source(session, git_ref, git_repo)
         files = await pinner.async_git_component(session, source, domain)
         self._guard_migration(domain, files, acknowledged)
         _LOGGER.info(
-            "Pinning %s to %s @ %s (%d files, targets core %s)",
+            "Pinning %s to %s@%s @ %s (%d files, targets core %s)",
             domain,
+            source.repo,
             source.ref,
             source.sha[:7],
             len(files),
             source.core_version,
         )
-        provenance = {"git_ref": source.ref, "git_sha": source.sha}
+        provenance = {"git_ref": source.ref, "git_sha": source.sha, "git_repo": source.repo}
         await self.hass.async_add_executor_job(
             pinner.install_component,
             files,

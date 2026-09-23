@@ -9,7 +9,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-from .const import STORAGE_KEY, STORAGE_VERSION
+from .const import GITHUB_REPO, STORAGE_KEY, STORAGE_VERSION
 
 
 @dataclass
@@ -25,6 +25,7 @@ class Pin:
     source: str = "pypi"  # "pypi", "git" or "adopted"
     git_ref: str = ""  # branch, tag or commit that was asked for
     git_sha: str = ""  # commit it resolved to
+    git_repo: str = GITHUB_REPO  # owner/name the commit came from
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -687,8 +687,20 @@ async def test_unchanged_panel_revalidates_to_an_empty_304(
     assert await second.read() == b""
 
 
-GH_API = "https://api.github.com/repos/home-assistant/core"
-GH_RAW = "https://raw.githubusercontent.com/home-assistant/core"
+CORE_REPO = "home-assistant/core"
+FORK = "someone/core"
+
+
+def _gh_api(repo=CORE_REPO):
+    return f"https://api.github.com/repos/{repo}"
+
+
+def _gh_raw(repo=CORE_REPO):
+    return f"https://raw.githubusercontent.com/{repo}"
+
+
+GH_API = _gh_api()
+GH_RAW = _gh_raw()
 FAKE_SHA = "90258e6ef6ca10d9789bd92004805143ca9b6cf0"
 FAKE_CONST_PY = (
     "MAJOR_VERSION: Final = 2026\n"
@@ -698,12 +710,12 @@ FAKE_CONST_PY = (
 )
 
 
-def _mock_github_ref(aioclient_mock, ref="dev", sha=FAKE_SHA, date=""):
+def _mock_github_ref(aioclient_mock, ref="dev", sha=FAKE_SHA, date="", repo=CORE_REPO):
     aioclient_mock.get(
-        f"{GH_API}/commits/{ref}",
+        f"{_gh_api(repo)}/commits/{ref}",
         json={"sha": sha, "commit": {"committer": {"date": date}}},
     )
-    aioclient_mock.get(f"{GH_RAW}/{sha}/homeassistant/const.py", text=FAKE_CONST_PY)
+    aioclient_mock.get(f"{_gh_raw(repo)}/{sha}/homeassistant/const.py", text=FAKE_CONST_PY)
 
 
 async def test_resolving_a_git_ref_records_the_commit_and_the_core_it_targets(
@@ -732,16 +744,16 @@ async def test_resolving_an_unknown_git_ref_is_a_clean_error(
         await pinner.async_resolve_git_source(async_get_clientsession(hass), "nope")
 
 
-def _mock_github_tree(aioclient_mock, domain, files, sha=FAKE_SHA, extra_tree=()):
+def _mock_github_tree(aioclient_mock, domain, files, sha=FAKE_SHA, extra_tree=(), repo=CORE_REPO):
     tree = [{"path": p, "type": "blob", "size": len(b)} for p, b in files.items()]
     tree.extend(extra_tree)
     aioclient_mock.get(
-        f"{GH_API}/git/trees/{sha}:homeassistant/components/{domain}",
+        f"{_gh_api(repo)}/git/trees/{sha}:homeassistant/components/{domain}",
         json={"tree": tree, "truncated": False},
     )
     for path, data in files.items():
         aioclient_mock.get(
-            f"{GH_RAW}/{sha}/homeassistant/components/{domain}/{path}", content=data
+            f"{_gh_raw(repo)}/{sha}/homeassistant/components/{domain}/{path}", content=data
         )
 
 
@@ -984,6 +996,7 @@ async def test_snapshot_advertises_what_this_backend_can_do(
 
     assert snap["features"] == list(FEATURES)
     assert "git" in snap["features"]
+    assert "git_repo" in snap["features"]
 
 
 async def test_version_listing_carries_release_dates(
@@ -1212,3 +1225,243 @@ async def test_pin_from_a_release_checks_the_migration_before_downloading(
     msg = await client.receive_json()
 
     assert not msg["success"] and "config entry" in msg["error"]["message"]
+
+
+# -- forks -----------------------------------------------------------------------
+
+
+async def test_resolving_a_ref_in_a_fork_reads_the_fork(
+    hass: HomeAssistant, setup, aioclient_mock
+):
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    _mock_github_ref(aioclient_mock, repo=FORK)
+
+    source = await pinner.async_resolve_git_source(async_get_clientsession(hass), "dev", FORK)
+
+    assert source.repo == FORK
+    assert source.sha == FAKE_SHA
+    assert source.version == "2026.10.0.dev0+90258e6"
+
+
+@pytest.mark.parametrize(
+    "repo", ["core", "a/b/c", "someone/..", "owner name/core", "https://example.com/a/b"]
+)
+def test_a_malformed_repository_is_refused(repo):
+    with pytest.raises(pinner.PinError, match="owner/name"):
+        pinner.normalize_repo(repo)
+
+
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        "https://github.com/someone/core",
+        "https://github.com/someone/core/",
+        "github.com/someone/core.git",
+        "  someone/core  ",
+    ],
+)
+def test_a_pasted_github_url_is_accepted_as_owner_name(pasted):
+    assert pinner.normalize_repo(pasted) == FORK
+
+
+def test_an_empty_repository_means_core():
+    assert pinner.normalize_repo("") == CORE_REPO
+
+
+async def test_a_malformed_repository_makes_no_request(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "git_ref": "dev", "git_repo": "nope"}
+    )
+    msg = await client.receive_json()
+
+    assert not msg["success"] and msg["error"]["code"] == "pin_error"
+    assert aioclient_mock.call_count == 0
+
+
+async def test_an_unknown_ref_in_a_fork_names_the_fork(
+    hass: HomeAssistant, setup, aioclient_mock
+):
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    aioclient_mock.get(f"{_gh_api(FORK)}/commits/nope", status=404, json={"message": "Not Found"})
+
+    with pytest.raises(pinner.PinError, match="someone/core"):
+        await pinner.async_resolve_git_source(async_get_clientsession(hass), "nope", FORK)
+
+
+async def test_a_repository_that_is_not_a_core_fork_says_so(
+    hass: HomeAssistant, setup, aioclient_mock
+):
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    aioclient_mock.get(
+        f"{_gh_api(FORK)}/commits/main",
+        json={"sha": FAKE_SHA, "commit": {"committer": {"date": ""}}},
+    )
+    aioclient_mock.get(f"{_gh_raw(FORK)}/{FAKE_SHA}/homeassistant/const.py", status=404)
+
+    with pytest.raises(pinner.PinError, match="fork of home-assistant/core"):
+        await pinner.async_resolve_git_source(async_get_clientsession(hass), "main", FORK)
+
+
+async def test_a_fork_without_that_integration_names_the_fork(
+    hass: HomeAssistant, setup, aioclient_mock
+):
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+    aioclient_mock.get(
+        f"{_gh_api(FORK)}/git/trees/{FAKE_SHA}:homeassistant/components/nope",
+        status=404,
+        json={"message": "Not Found"},
+    )
+    source = pinner.GitSource(ref="dev", sha=FAKE_SHA, core_version="2026.10.0.dev0", repo=FORK)
+
+    with pytest.raises(pinner.PinError, match="someone/core at dev has no core integration 'nope'"):
+        await pinner.async_git_component(async_get_clientsession(hass), source, "nope")
+
+
+async def test_pinning_from_a_fork_records_the_repository(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, tmp_path
+):
+    _mock_github_ref(aioclient_mock, repo=FORK)
+    _mock_github_tree(
+        aioclient_mock,
+        FAKE_DOMAIN,
+        {"__init__.py": b"forked fix", "manifest.json": b'{"domain": "sun", "requirements": []}'},
+        repo=FORK,
+    )
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": "dev", "git_repo": FORK}
+    )
+    assert (await client.receive_json())["success"]
+
+    override = tmp_path / "custom_components" / FAKE_DOMAIN
+    assert (override / "__init__.py").read_bytes() == b"forked fix"
+    assert json.loads((override / MARKER_FILE).read_text())["git_repo"] == FORK
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    (pin,) = (await client.receive_json())["result"]["pins"]
+    assert pin["source"] == "git"
+    assert pin["git_repo"] == FORK
+    assert pin["git_sha"] == FAKE_SHA
+
+
+async def test_pinning_from_core_records_core_as_the_repository(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(
+        aioclient_mock, FAKE_DOMAIN, {"__init__.py": b"x", "manifest.json": b'{"domain": "sun"}'}
+    )
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": "dev"}
+    )
+    assert (await client.receive_json())["result"]["git_repo"] == CORE_REPO
+
+
+async def test_compare_against_a_fork_labels_it_with_the_repository(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    _mock_github_ref(aioclient_mock, repo=FORK)
+    _mock_github_tree(
+        aioclient_mock,
+        FAKE_DOMAIN,
+        {"__init__.py": b"new", "manifest.json": b'{"domain": "sun"}'},
+        repo=FORK,
+    )
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "git_ref": "dev", "git_repo": FORK}
+    )
+    result = (await client.receive_json())["result"]
+
+    assert result["version"] == "someone/core@dev @ 90258e6"
+    assert result["identical"] is False
+
+
+async def test_compare_baselines_a_fork_pin_against_the_fork(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    """Only the fork is mocked, so a baseline fetched from core would fail the request."""
+    _mock_github_ref(aioclient_mock, repo=FORK)
+    _mock_github_tree(
+        aioclient_mock,
+        FAKE_DOMAIN,
+        {"__init__.py": b"old", "manifest.json": b'{"domain": "sun"}'},
+        repo=FORK,
+    )
+    _mock_github_ref(aioclient_mock, ref="fix", sha=OTHER_SHA, repo=FORK)
+    _mock_github_tree(
+        aioclient_mock,
+        FAKE_DOMAIN,
+        {"__init__.py": b"new", "manifest.json": b'{"domain": "sun"}'},
+        sha=OTHER_SHA,
+        repo=FORK,
+    )
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": "dev", "git_repo": FORK}
+    )
+    assert (await client.receive_json())["success"]
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "git_ref": "fix", "git_repo": FORK}
+    )
+    result = (await client.receive_json())["result"]
+
+    assert result["compared_with"] == "pinned 2026.10.0.dev0+90258e6"
+    assert result["changed"] == ["__init__.py"]
+
+
+async def test_repinning_a_fork_pin_by_its_commit_refetches_from_the_fork(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, tmp_path
+):
+    """The panel's Re-pin sends the recorded sha and repo, not the version string."""
+    files = {"__init__.py": b"forked fix", "manifest.json": b'{"domain": "sun"}'}
+    _mock_github_ref(aioclient_mock, repo=FORK)
+    _mock_github_ref(aioclient_mock, ref=FAKE_SHA, repo=FORK)
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, files, repo=FORK)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": "dev", "git_repo": FORK}
+    )
+    assert (await client.receive_json())["success"]
+    override = tmp_path / "custom_components" / FAKE_DOMAIN
+    import shutil
+
+    shutil.rmtree(override)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": FAKE_SHA, "git_repo": FORK}
+    )
+    repinned = (await client.receive_json())["result"]
+
+    assert (override / "__init__.py").read_bytes() == b"forked fix"
+    assert repinned["git_repo"] == FORK and repinned["git_sha"] == FAKE_SHA
+
+
+def test_a_pin_stored_before_forks_loads_as_a_core_pin():
+    from custom_components.integration_pins.store import Pin
+
+    pin = Pin.from_dict(
+        {
+            "domain": "sun",
+            "pinned_version": "2026.10.0.dev0+90258e6",
+            "core_range": "",
+            "source": "git",
+            "git_ref": "dev",
+            "git_sha": FAKE_SHA,
+        }
+    )
+
+    assert pin.git_repo == CORE_REPO

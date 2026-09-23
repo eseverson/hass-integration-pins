@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 DOMAIN = "integration_pins"
 
 STORAGE_KEY = DOMAIN
@@ -33,6 +35,7 @@ FEATURES = (
     "retired",
     "custom_integrations",
     "migration",
+    "git_repo",
 )
 
 # Where a pin's code came from.
@@ -40,9 +43,17 @@ SOURCE_PYPI = "pypi"  # extracted from a release wheel
 SOURCE_GIT = "git"  # fetched from a commit in the core repository
 SOURCE_ADOPTED = "adopted"  # a directory that was already there
 
+# Git pins come from core or from a fork of it laid out the same way.
 GITHUB_REPO = "home-assistant/core"
-GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
-GITHUB_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}"
+GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$")
+
+
+def github_api_url(repo: str) -> str:
+    return f"https://api.github.com/repos/{repo}"
+
+
+def github_raw_url(repo: str) -> str:
+    return f"https://raw.githubusercontent.com/{repo}"
 
 PYPI_PROJECT = "homeassistant"
 PYPI_JSON_URL = f"https://pypi.org/pypi/{PYPI_PROJECT}/json"

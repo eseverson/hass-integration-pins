@@ -28,12 +28,14 @@ from packaging.version import InvalidVersion, Version
 from homeassistant.exceptions import HomeAssistantError
 
 from .const import (
-    GITHUB_API_URL,
-    GITHUB_RAW_URL,
+    GITHUB_REPO,
+    GITHUB_REPO_RE,
     MARKER_FILE,
     PYPI_JSON_URL,
     PYPI_VERSION_URL,
     RETIRED_DIRNAME,
+    github_api_url,
+    github_raw_url,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -162,7 +164,7 @@ async def async_download(session: aiohttp.ClientSession, wheel: WheelInfo, dest:
 # ---------------------------------------------------------------------------
 # GitHub
 #
-# The repository is not the release: HA generates the non-English translations at
+# Core, or a fork of it laid out the same way. The repository is not the release: HA generates the non-English translations at
 # build time, so a git pin ships English only. In exchange it is far cheaper than a
 # wheel -- two API calls for the commit and the integration's file list, then the
 # files themselves from raw.githubusercontent.com, which is not rate limited.
@@ -174,17 +176,39 @@ _MAX_CONCURRENT_BLOBS = 8
 
 @dataclass
 class GitSource:
-    """A resolved point in the core repository."""
+    """A resolved point in core, or in a fork of it."""
 
     ref: str  # what was asked for: a branch, a tag or a commit
     sha: str  # the commit it resolved to
     core_version: str  # the core version that commit builds
     date: str = ""  # YYYY-MM-DD the commit was made
+    repo: str = GITHUB_REPO  # owner/name on GitHub
 
     @property
     def version(self) -> str:
         """Manifest version for code taken from this commit."""
         return f"{self.core_version}+{self.sha[:7]}"
+
+    @property
+    def where(self) -> str:
+        """How error messages name the repository."""
+        return "Home Assistant" if self.repo == GITHUB_REPO else self.repo
+
+
+_GITHUB_PREFIXES = ("https://github.com/", "http://github.com/", "github.com/")
+
+
+def normalize_repo(repo: str) -> str:
+    """owner/name from what was typed or pasted; empty means core."""
+    repo = repo.strip()
+    for prefix in _GITHUB_PREFIXES:
+        if repo.lower().startswith(prefix):
+            repo = repo[len(prefix) :]
+            break
+    repo = repo.rstrip("/").removesuffix(".git") or GITHUB_REPO
+    if not GITHUB_REPO_RE.match(repo) or ".." in repo:
+        raise PinError(f"'{repo}' is not a GitHub repository; enter it as owner/name")
+    return repo
 
 
 async def _github_json(session: aiohttp.ClientSession, url: str, missing: str, **kwargs) -> Any:
@@ -212,32 +236,40 @@ def _parse_core_version(const_py: str) -> str:
     return ".".join(parts)
 
 
-async def async_resolve_git_source(session: aiohttp.ClientSession, ref: str) -> GitSource:
+async def async_resolve_git_source(
+    session: aiohttp.ClientSession, ref: str, repo: str = GITHUB_REPO
+) -> GitSource:
     """Pin a branch, tag or commit down to one immutable commit."""
     ref = ref.strip()
+    repo = normalize_repo(repo)
     if not ref:
         raise PinError("Enter a branch, tag or commit to take the code from")
 
     data = await _github_json(
         session,
-        f"{GITHUB_API_URL}/commits/{ref}",
-        f"'{ref}' is not a branch, tag or commit in home-assistant/core",
+        f"{github_api_url(repo)}/commits/{ref}",
+        f"'{ref}' is not a branch, tag or commit in {repo}",
     )
     sha = data.get("sha")
     if not sha:
         raise PinError(f"GitHub returned no commit for '{ref}'")
 
     async with session.get(
-        f"{GITHUB_RAW_URL}/{sha}/homeassistant/const.py",
+        f"{github_raw_url(repo)}/{sha}/homeassistant/const.py",
         timeout=aiohttp.ClientTimeout(total=30),
     ) as resp:
+        if resp.status == 404:
+            raise PinError(
+                f"{repo} has no homeassistant/const.py at {sha[:7]}; "
+                f"is it a fork of {GITHUB_REPO}?"
+            )
         if resp.status != 200:
             raise PinError(f"Could not read the core version at {sha[:7]}")
         const_py = await resp.text()
 
     committed = (data.get("commit", {}).get("committer", {}).get("date") or "")[:10]
     return GitSource(
-        ref=ref, sha=sha, core_version=_parse_core_version(const_py), date=committed
+        ref=ref, sha=sha, core_version=_parse_core_version(const_py), date=committed, repo=repo
     )
 
 
@@ -245,10 +277,11 @@ async def async_git_component(
     session: aiohttp.ClientSession, source: GitSource, domain: str
 ) -> dict[str, bytes]:
     """Every file of homeassistant/components/<domain>/ at a commit, keyed by path."""
+    missing = f"{source.where} at {source.ref} has no core integration '{domain}'"
     data = await _github_json(
         session,
-        f"{GITHUB_API_URL}/git/trees/{source.sha}:homeassistant/components/{domain}",
-        f"Home Assistant at {source.ref} has no core integration '{domain}'",
+        f"{github_api_url(source.repo)}/git/trees/{source.sha}:homeassistant/components/{domain}",
+        missing,
         params={"recursive": "1"},
     )
     if data.get("truncated"):
@@ -260,12 +293,13 @@ async def async_git_component(
         if entry.get("type") == "blob" and "__pycache__/" not in entry.get("path", "")
     ]
     if not paths:
-        raise PinError(f"Home Assistant at {source.ref} has no core integration '{domain}'")
+        raise PinError(missing)
 
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_BLOBS)
+    raw = github_raw_url(source.repo)
 
     async def fetch(path: str) -> tuple[str, bytes]:
-        url = f"{GITHUB_RAW_URL}/{source.sha}/homeassistant/components/{domain}/{path}"
+        url = f"{raw}/{source.sha}/homeassistant/components/{domain}/{path}"
         async with semaphore:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status != 200:

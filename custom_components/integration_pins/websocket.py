@@ -10,7 +10,7 @@ import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
-from .const import DOMAIN
+from .const import DOMAIN, GITHUB_REPO
 from .manager import PinManager
 from .pinner import MigrationBlocked, PinError
 
@@ -130,6 +130,7 @@ async def ws_versions(hass, connection, msg: dict[str, Any]) -> None:
         vol.Required("domain"): str,
         vol.Optional("version", default=""): str,
         vol.Optional("git_ref", default=""): str,
+        vol.Optional("git_repo", default=GITHUB_REPO): str,
         vol.Optional("core_range", default=""): str,
         vol.Optional("reason", default=""): str,
         vol.Optional("acknowledge_migration", default=False): bool,
@@ -145,6 +146,7 @@ async def ws_pin(hass, connection, msg: dict[str, Any]) -> None:
         msg["reason"],
         msg["git_ref"],
         msg["acknowledge_migration"],
+        git_repo=msg["git_repo"],
     )
     connection.send_result(msg["id"], pin.as_dict())
 
@@ -237,6 +239,7 @@ async def ws_clear_retired(hass, connection, msg: dict[str, Any]) -> None:
         vol.Required("domain"): str,
         vol.Optional("version", default=""): str,
         vol.Optional("git_ref", default=""): str,
+        vol.Optional("git_repo", default=GITHUB_REPO): str,
     }
 )
 @websocket_api.async_response
@@ -244,5 +247,7 @@ async def ws_clear_retired(hass, connection, msg: dict[str, Any]) -> None:
 async def ws_compare(hass, connection, msg: dict[str, Any]) -> None:
     connection.send_result(
         msg["id"],
-        await _manager(hass).async_compare(msg["domain"], msg["version"], msg["git_ref"]),
+        await _manager(hass).async_compare(
+            msg["domain"], msg["version"], msg["git_ref"], msg["git_repo"]
+        ),
     )
