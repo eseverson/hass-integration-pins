@@ -1745,3 +1745,12 @@ async def test_unpinning_an_upload_retires_it(
     retired = list((tmp_path / RETIRED_DIRNAME).iterdir())
     assert len(retired) == 1 and retired[0].name.startswith(f"{FAKE_DOMAIN}-")
     assert (retired[0] / "__init__.py").read_bytes() == b"my local fix"
+
+
+@pytest.mark.parametrize("issue", ["pin_missing", "pin_foreign"])
+def test_repair_advice_covers_uploaded_pins(issue):
+    """An uploaded pin has no Re-pin: its only way back is picking the folder again."""
+    root = Path(__file__).parent.parent / "custom_components" / DOMAIN
+    for name in ("strings.json", "translations/en.json"):
+        text = json.loads((root / name).read_text())["issues"][issue]["description"]
+        assert "pick its folder again" in text, name
