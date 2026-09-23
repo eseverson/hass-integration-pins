@@ -12,6 +12,16 @@
 const PANEL_FEATURES = ["in_use", "domain_info", "compare", "git", "retired", "custom_integrations", "git_repo", "upload"];
 const CORE_REPO = "home-assistant/core";
 
+/* owner/name from what was typed or pasted, as pinner.normalize_repo reads it; empty
+ * means core. Links are built from this, so a pasted URL must not end up inside one. */
+const normalizeRepo = (text) => {
+  let repo = String(text || "").trim();
+  const prefix = ["https://github.com/", "http://github.com/", "github.com/"].find((p) => repo.toLowerCase().startsWith(p));
+  if (prefix) repo = repo.slice(prefix.length);
+  repo = repo.replace(/\/+$/, "").replace(/\.git$/, "");
+  return repo || CORE_REPO;
+};
+
 const STATUS_LABEL = {
   active: "Active",
   pending: "Pending restart",
@@ -163,7 +173,7 @@ class IntegrationPinsPanel extends HTMLElement {
     const src = this._effectiveSource();
     const domain = (form?.domain?.value || "").trim().toLowerCase();
     const ref = (form?.git_ref?.value || "").trim();
-    const repo = (form?.git_repo?.value || "").trim() || CORE_REPO;
+    const repo = normalizeRepo(form?.git_repo?.value);
     const version = (form?.version?.value || "").trim();
     this._fieldErrors = {};
     if (!domain) this._fieldErrors.domain = "Pick an integration first";
@@ -599,7 +609,7 @@ class IntegrationPinsPanel extends HTMLElement {
   }
 
   _historyLink(path, text, ref = "dev", since = "", repo = CORE_REPO) {
-    return `<a href="${this._historyUrl(path, ref, since, repo)}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`;
+    return `<a href="${esc(this._historyUrl(path, ref, since, repo))}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`;
   }
 
   _domainLinksHtml() {
@@ -833,7 +843,7 @@ class IntegrationPinsPanel extends HTMLElement {
 
   /* Where history and commit links point: the fork being pinned from, else core. */
   _linkRepo() {
-    return this._effectiveSource() === "git" ? this._gitRepo.trim() || CORE_REPO : CORE_REPO;
+    return this._effectiveSource() === "git" ? normalizeRepo(this._gitRepo) : CORE_REPO;
   }
 
   _staleBackend() {
@@ -897,7 +907,7 @@ class IntegrationPinsPanel extends HTMLElement {
     const repo = p.git_repo || CORE_REPO;
     const commit = `https://github.com/${repo}/commit/${encodeURIComponent(p.git_sha)}`;
     const where = repo === CORE_REPO ? "" : `${esc(repo)} `;
-    return `<span class="tag">git</span> ${where}${esc(p.git_ref)} @ <a href="${commit}" target="_blank" rel="noopener noreferrer">${esc((p.git_sha || "").slice(0, 7))}</a>`;
+    return `<span class="tag">git</span> ${where}${esc(p.git_ref)} @ <a href="${esc(commit)}" target="_blank" rel="noopener noreferrer">${esc((p.git_sha || "").slice(0, 7))}</a>`;
   }
 
   _reqDiff(p) {
