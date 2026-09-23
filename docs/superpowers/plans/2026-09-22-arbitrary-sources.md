@@ -64,7 +64,7 @@ Run tests with: `. .venv/bin/activate && pytest -q` (baseline: 60 passed).
 **Interfaces:**
 - Produces: `const.GITHUB_REPO: str`, `const.github_api_url(repo: str) -> str`, `const.github_raw_url(repo: str) -> str`; `pinner.normalize_repo(repo: str) -> str`; `pinner.GitSource(ref, sha, core_version, date="", repo=GITHUB_REPO)`; `pinner.async_resolve_git_source(session, ref, repo=GITHUB_REPO) -> GitSource`; `Pin.git_repo: str = GITHUB_REPO`; `PinManager.async_compare(domain, version="", git_ref="", git_repo=GITHUB_REPO)`; `PinManager.async_pin(domain, version="", core_range="", reason="", git_ref="", acknowledge_migration=False, git_repo=GITHUB_REPO)`; websocket `pin`/`compare` accept `git_repo`.
 
-- [ ] **Step 1: Generalize the GitHub test helpers and write the failing fork tests**
+- [x] **Step 1: Generalize the GitHub test helpers and write the failing fork tests**
 
 In `tests/test_integration_pins.py`, replace the `GH_API` / `GH_RAW` constants and the two helpers so they take a repo (existing callers keep working through the default):
 
@@ -357,12 +357,12 @@ Also add to `test_snapshot_advertises_what_this_backend_can_do`, after the `"git
     assert "git_repo" in snap["features"]
 ```
 
-- [ ] **Step 2: Run the new tests to verify they fail**
+- [x] **Step 2: Run the new tests to verify they fail**
 
 Run: `. .venv/bin/activate && pytest -q -k "fork or repository or pasted or malformed or before_forks or core_as_the or advertises"`
 Expected: FAIL — `AttributeError: module ... has no attribute 'normalize_repo'`, `TypeError: ... unexpected keyword argument 'repo'`, `extra keys not allowed @ data['git_repo']`.
 
-- [ ] **Step 3: Add the repo constants and helpers to `const.py`**
+- [x] **Step 3: Add the repo constants and helpers to `const.py`**
 
 Replace the three `GITHUB_*` lines with:
 
@@ -382,7 +382,7 @@ def github_raw_url(repo: str) -> str:
 
 Add `import re` under `from __future__ import annotations`, and append `"git_repo",` to `FEATURES`.
 
-- [ ] **Step 4: Make the git fetch path repo-aware in `pinner.py`**
+- [x] **Step 4: Make the git fetch path repo-aware in `pinner.py`**
 
 In the `from .const import (...)` block, replace `GITHUB_API_URL, GITHUB_RAW_URL,` with `GITHUB_REPO, GITHUB_REPO_RE, github_api_url, github_raw_url,`.
 
@@ -526,7 +526,7 @@ async def async_git_component(
 
 Also update the section comment above `_VERSION_PARTS` if it names only `home-assistant/core`, so it says "core or a fork of it".
 
-- [ ] **Step 5: Store the repository on the pin (`store.py`)**
+- [x] **Step 5: Store the repository on the pin (`store.py`)**
 
 Add `from .const import GITHUB_REPO` to the imports and, after `git_sha`:
 
@@ -534,7 +534,7 @@ Add `from .const import GITHUB_REPO` to the imports and, after `git_sha`:
     git_repo: str = GITHUB_REPO  # owner/name the commit came from
 ```
 
-- [ ] **Step 6: Thread `git_repo` through the manager**
+- [x] **Step 6: Thread `git_repo` through the manager**
 
 In `manager.py`, add `GITHUB_REPO` to the `from .const import (...)` block.
 
@@ -602,7 +602,7 @@ In `_async_baseline`:
 
 (the rest of the method is unchanged).
 
-- [ ] **Step 7: Accept `git_repo` over the websocket**
+- [x] **Step 7: Accept `git_repo` over the websocket**
 
 In `websocket.py`, import `GITHUB_REPO` from `.const`. In both the `pin` and `compare` schemas add after `git_ref`:
 
@@ -612,12 +612,12 @@ In `websocket.py`, import `GITHUB_REPO` from `.const`. In both the `pin` and `co
 
 `ws_pin` calls `async_pin(..., msg["acknowledge_migration"], git_repo=msg["git_repo"])`; `ws_compare` calls `async_compare(msg["domain"], msg["version"], msg["git_ref"], msg["git_repo"])`.
 
-- [ ] **Step 8: Run the whole suite**
+- [x] **Step 8: Run the whole suite**
 
 Run: `. .venv/bin/activate && pytest -q`
 Expected: all pass (60 existing + the new fork tests).
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add custom_components/integration_pins/const.py custom_components/integration_pins/pinner.py custom_components/integration_pins/store.py custom_components/integration_pins/manager.py custom_components/integration_pins/websocket.py tests/test_integration_pins.py
@@ -641,7 +641,7 @@ git commit -m "feat(pins): take git pins from a github fork of core"
 - Consumes: `PinManager.async_compare(domain, version, git_ref, git_repo)` and `async_pin(..., git_repo=...)` from Task 1.
 - Produces: `uploads.UPLOAD_URL = "/api/integration_pins/upload"`; `uploads.Upload(domain, label, files, version, created=0.0)`; `uploads.UploadStaging(clock=time.monotonic)` with `.add(upload) -> str`, `.get(upload_id) -> Upload`, `.discard(upload_id)`; `uploads.content_version(core_version, files) -> str`; `uploads.validate_upload(domain, files)`; `PinManager.uploads: UploadStaging`; `PinManager.async_stage_upload(domain, label, files) -> dict` with keys `upload_id, domain, files, version`; `async_compare(..., upload_id="")`; `async_pin(..., upload_id="")`; `Pin.upload_label: str = ""`; `const.SOURCE_UPLOAD = "upload"`. Multipart field names: `domain`, `label`, and `f:<relative path>` per file.
 
-- [ ] **Step 1: Write the failing upload tests**
+- [x] **Step 1: Write the failing upload tests**
 
 Append to `tests/test_integration_pins.py` (add `import aiohttp` to the imports at the top):
 
@@ -930,12 +930,12 @@ Also add to `test_snapshot_advertises_what_this_backend_can_do`:
     assert "upload" in snap["features"]
 ```
 
-- [ ] **Step 2: Run the new tests to verify they fail**
+- [x] **Step 2: Run the new tests to verify they fail**
 
 Run: `. .venv/bin/activate && pytest -q -k "upload or advertises"`
 Expected: FAIL — upload POSTs return 404, `ModuleNotFoundError: ... uploads`, `extra keys not allowed @ data['upload_id']`.
 
-- [ ] **Step 3: Constants and the stored field**
+- [x] **Step 3: Constants and the stored field**
 
 `const.py`: after `SOURCE_ADOPTED` add
 
@@ -951,7 +951,7 @@ and append `"upload",` to `FEATURES`.
     upload_label: str = ""  # name of the folder an uploaded pin came from
 ```
 
-- [ ] **Step 4: Create `uploads.py`**
+- [x] **Step 4: Create `uploads.py`**
 
 ```python
 """Integration code uploaded from the browser.
@@ -1132,7 +1132,7 @@ class UploadView(HomeAssistantView):
 
 Check `KEY_HASS` is exported from `homeassistant.components.http` (it is imported at `homeassistant/components/http/__init__.py:45`). If an import fails, use `request.app["hass"]`.
 
-- [ ] **Step 5: Stage, compare and pin uploads in the manager**
+- [x] **Step 5: Stage, compare and pin uploads in the manager**
 
 `manager.py` imports: change `from . import pinner` to `from . import pinner, uploads` and add `SOURCE_UPLOAD` to the const block. In `__init__`:
 
@@ -1231,7 +1231,7 @@ Add after `_async_install_from_git`:
 
 Update the comment in `async_unpin` above `keep_a_copy` to: `# PyPI and git pins record where they came from, so the files can be fetched again; adopted and uploaded ones exist nowhere else.` (the condition itself already keeps uploads).
 
-- [ ] **Step 6: Accept `upload_id` over the websocket and register the view**
+- [x] **Step 6: Accept `upload_id` over the websocket and register the view**
 
 `websocket.py`: in both the `pin` and `compare` schemas add `vol.Optional("upload_id", default=""): str,`; `ws_pin` passes `upload_id=msg["upload_id"]`; `ws_compare` passes `upload_id=msg["upload_id"]`.
 
@@ -1241,12 +1241,12 @@ Update the comment in `async_unpin` above `keep_a_copy` to: `# PyPI and git pins
         hass.http.register_view(UploadView())
 ```
 
-- [ ] **Step 7: Run the whole suite**
+- [x] **Step 7: Run the whole suite**
 
 Run: `. .venv/bin/activate && pytest -q`
 Expected: all pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add custom_components/integration_pins/uploads.py custom_components/integration_pins/const.py custom_components/integration_pins/store.py custom_components/integration_pins/manager.py custom_components/integration_pins/websocket.py custom_components/integration_pins/__init__.py tests/test_integration_pins.py
@@ -1266,7 +1266,7 @@ git commit -m "feat(pins): pin an integration folder uploaded from the browser"
 
 There is no JS test harness in this repo; verification is `node --check` plus a manual pass in a running Home Assistant (Step 9).
 
-- [ ] **Step 1: Constants and state**
+- [x] **Step 1: Constants and state**
 
 Change `PANEL_FEATURES` to:
 
@@ -1284,7 +1284,7 @@ In the constructor, replace the `_source` line and add after `_gitRef`:
     this._upload = null; // {upload_id, domain, files, version, label} staged on the backend
 ```
 
-- [ ] **Step 2: One place decides the effective source**
+- [x] **Step 2: One place decides the effective source**
 
 Add after `_backendHas`:
 
@@ -1302,7 +1302,7 @@ Add after `_backendHas`:
   }
 ```
 
-- [ ] **Step 3: `_formSource` and `_candidateKey` understand all three sources**
+- [x] **Step 3: `_formSource` and `_candidateKey` understand all three sources**
 
 Replace `_formSource` and `_candidateKey` with:
 
@@ -1350,7 +1350,7 @@ Replace `_formSource` and `_candidateKey` with:
   }
 ```
 
-- [ ] **Step 4: Upload the folder as soon as it is picked**
+- [x] **Step 4: Upload the folder as soon as it is picked**
 
 The file input has no `name` on purpose: `_render` restores named fields from `FormData`, and assigning a value to a file input throws. It is found by `data-role="folder"` instead, and the staged upload lives in `this._upload`, so re-renders lose nothing.
 
@@ -1441,7 +1441,7 @@ In `_onInput`, handle the repository like the ref (add before the `git_ref` bran
     }
 ```
 
-- [ ] **Step 5: The form**
+- [x] **Step 5: The form**
 
 In `_addCard`, replace the `canGit` / `git` lines with:
 
@@ -1493,7 +1493,7 @@ and replace the whole "Take code from" `<label>` with:
             </label>
 ```
 
-- [ ] **Step 6: Source warning and links**
+- [x] **Step 6: Source warning and links**
 
 Replace `_sourceWarningHtml` with:
 
@@ -1563,7 +1563,7 @@ In the compare file list (currently line ~294), pass the repo so a fork's files 
 
 In the `case "source":` click handler add `this._upload = null;` alongside the other resets.
 
-- [ ] **Step 7: Pin rows, unpin text and re-pin**
+- [x] **Step 7: Pin rows, unpin text and re-pin**
 
 In `_pinRow`, replace the domain and version cells:
 
@@ -1613,12 +1613,12 @@ In `_unpin`, change the git wording to name the repository:
       ? `custom_components/${domain}/ is deleted; it came from ${pin.source === "git" ? `a commit in ${pin.git_repo || CORE_REPO}` : "a release on PyPI"}, so re-pinning fetches it again.`
 ```
 
-- [ ] **Step 8: Syntax check**
+- [x] **Step 8: Syntax check**
 
 Run: `node --check custom_components/integration_pins/panel/integration-pins-panel.js`
 Expected: no output, exit 0. Also `grep -n "canGit && this._source" custom_components/integration_pins/panel/integration-pins-panel.js` — expected no matches (every source decision goes through `_effectiveSource`).
 
-- [ ] **Step 9: Manual check in a running Home Assistant**
+- [x] **Step 9: Manual check in a running Home Assistant**
 
 With this checkout's `custom_components/integration_pins` loaded in a dev Home Assistant (restart for the Python, reload the browser for the panel), confirm:
 
@@ -1629,7 +1629,9 @@ With this checkout's `custom_components/integration_pins` loaded in a dev Home A
 
 If no dev instance is available, report this step as not done instead of claiming it.
 
-- [ ] **Step 10: Commit**
+_Done 2026-09-22 against a throwaway instance on :18123 driven by headless Playwright; a real fork was not exercised in the browser (backend tests cover it)._
+
+- [x] **Step 10: Commit**
 
 ```bash
 git add custom_components/integration_pins/panel/integration-pins-panel.js
@@ -1644,7 +1646,7 @@ git commit -m "feat(panel): pick a fork or upload a folder as the pin's source"
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-09-22-arbitrary-sources.md` (tick boxes)
 
-- [ ] **Step 1: Document the sources**
+- [x] **Step 1: Document the sources**
 
 In `README.md` under "Using it", after the "Take the code from git" paragraph, add (each paragraph one line, no hard wraps):
 
@@ -1656,19 +1658,19 @@ In `README.md` under "Using it", after the "Take the code from git" paragraph, a
 
 In "Development", add `  uploads.py        folder uploads: HTTP view, validation, in-memory staging` to the module list after `pinner.py`.
 
-- [ ] **Step 2: Full test run**
+- [x] **Step 2: Full test run**
 
 Run: `. .venv/bin/activate && pytest -q`
 Expected: all pass.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add README.md docs/superpowers/plans/2026-09-22-arbitrary-sources.md
 git commit -m "docs(readme): describe pinning from forks and uploaded folders"
 ```
 
-- [ ] **Step 4: Release the agent claim**
+- [x] **Step 4: Release the agent claim**
 
 ```bash
 rm "$(git rev-parse --git-common-dir)/agent-claims/arbitrary-sources.md"

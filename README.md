@@ -35,6 +35,10 @@ The panel appears in the sidebar for admin users. It needs outbound HTTPS to `py
 
 **Take the code from git** instead to pick up a fix that has merged but not shipped — enter a branch, tag or commit. Two caveats, which the panel also states: the repository carries English translations only, and `dev` is written against the *next* core release, so it can call helpers your core does not have yet.
 
+**From a fork** — the git option also takes a GitHub repository, `home-assistant/core` by default. Any fork of core laid out the same way works, so a fix in someone's fork can be pinned before it is merged; a pasted `https://github.com/owner/core` URL is fine.
+
+**From a folder** — pick an integration's directory from a checkout on the machine your browser runs on, e.g. `homeassistant/components/zha`, and the panel uploads it. Pick the integration's own directory, not the whole checkout. Home Assistant never needs to reach that machine, which is what makes this work when core runs in a container and the checkout lives on the host. The upload is held for 15 minutes for Compare and Pin. It has no other copy, so unpinning keeps it in `integration_pins_retired/` and there is no Re-pin; the version is your core's plus a hash of the files, like `2026.9.1+local.3fa94c1`.
+
 **Compare with running code** says which files differ from what you are running, or that a release is identical to it and pinning would change nothing. Pin runs it for you if you have not: the first press shows what the change would do, the second commits it. The domain field links the integration's upstream history, where **changed since &lt;release&gt;** is the commits between that release and now; each changed file links to the commits that touched it.
 
 When other integrations are built on the one you picked, the form says how many depend on it and which of those are loaded here.
@@ -43,7 +47,7 @@ When other integrations are built on the one you picked, the form says how many 
 
 **Edit** changes the range or reason. **Unpin** removes the override; restart to go back to the bundled integration. **Re-pin** appears if the override goes missing or is replaced.
 
-Unpinning deletes a pin taken from PyPI or git, since re-pinning fetches it again. An **adopted** copy exists nowhere else, so it is kept in `integration_pins_retired/` and listed at the bottom of the panel with a Delete button.
+Unpinning deletes a pin taken from PyPI or git, since re-pinning fetches it again. An **adopted** or uploaded copy exists nowhere else, so it is kept in `integration_pins_retired/` and listed at the bottom of the panel with a Delete button.
 
 The panel also lists everything else in `custom_components/` and where it came from. Several HACS integrations replace a core one — `plant` is the usual example — and those should be left to HACS; adopting one would put two things in charge of the same directory. **Adopt** is for a copy you placed by hand, so it gets the same range checking.
 
@@ -77,6 +81,7 @@ custom_components/integration_pins/
   __init__.py       entry setup, panel registration
   manager.py        orchestrates pins, evaluates ranges, syncs Repair issues
   pinner.py         PyPI and GitHub lookup, download/verify, comparison, extract/retire
+  uploads.py        folder uploads: HTTP view, validation, in-memory staging
   store.py          .storage/integration_pins persistence
   websocket.py      integration_pins/* commands used by the panel
   config_flow.py    single-instance config entry
