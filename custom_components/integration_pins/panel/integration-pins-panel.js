@@ -9,7 +9,8 @@
  * it only changes when Home Assistant restarts. Anything the running backend does not
  * advertise is hidden, and the page says why, instead of sending a request its older
  * websocket schema would reject with a validation error. */
-const PANEL_FEATURES = ["in_use", "domain_info", "compare", "git", "retired", "custom_integrations"];
+const PANEL_FEATURES = ["in_use", "domain_info", "compare", "git", "retired", "custom_integrations", "git_repo", "upload"];
+const CORE_REPO = "home-assistant/core";
 
 const STATUS_LABEL = {
   active: "Active",
@@ -51,8 +52,10 @@ class IntegrationPinsPanel extends HTMLElement {
     this._domainInfo = null; // dependency info for the domain currently typed in
     this._domainInfoTimer = null;
     this._compare = null; // result of the last "Compare" against the running code
-    this._source = "release"; // "release" (a PyPI wheel) or "git" (a commit in core)
+    this._source = "release"; // "release" (a PyPI wheel), "git" (a commit in core or a fork) or "upload"
     this._gitRef = "dev";
+    this._gitRepo = CORE_REPO;
+    this._upload = null; // {upload_id, domain, files, version, label} staged on the backend
     this._fieldErrors = {}; // field name -> message, shown against the input itself
     this._resetting = false; // set for one render, to drop the values instead of keeping them
     this._errorCode = null; // websocket error code of the last failed call
@@ -157,31 +160,45 @@ class IntegrationPinsPanel extends HTMLElement {
    * the offending field when something is missing, so the message lands on the input
    * rather than in a banner at the top of the page. */
   _formSource(form) {
-    const canGit = this._backendHas("git");
-    const git = canGit && this._source === "git";
+    const src = this._effectiveSource();
     const domain = (form?.domain?.value || "").trim().toLowerCase();
     const ref = (form?.git_ref?.value || "").trim();
+    const repo = (form?.git_repo?.value || "").trim() || CORE_REPO;
     const version = (form?.version?.value || "").trim();
     this._fieldErrors = {};
     if (!domain) this._fieldErrors.domain = "Pick an integration first";
-    if (git && !ref) this._fieldErrors.git_ref = "Enter a branch, tag or commit";
-    if (!git && !version) this._fieldErrors.version = "Pick a release first";
+    if (src === "git" && !ref) this._fieldErrors.git_ref = "Enter a branch, tag or commit";
+    if (src === "release" && !version) this._fieldErrors.version = "Pick a release first";
+    if (src === "upload" && !this._upload) this._fieldErrors.folder = "Pick the integration's folder first";
+    if (src === "upload" && this._upload && domain && this._upload.domain !== domain)
+      this._fieldErrors.folder = `That folder is ${this._upload.domain}, not ${domain}`;
     if (Object.keys(this._fieldErrors).length) {
       this._paintFieldErrors();
       return null;
     }
-    return git
-      ? { domain, payload: { git_ref: ref }, label: `${ref}`, busy: `Fetching ${domain} from ${ref}…` }
-      : {
-          domain,
-          payload: { version },
-          label: version,
-          busy: `Downloading Home Assistant ${version} and extracting ${domain}… this can take a minute.`,
-        };
+    if (src === "git") {
+      const label = repo === CORE_REPO ? ref : `${repo}@${ref}`;
+      const payload = this._backendHas("git_repo") ? { git_ref: ref, git_repo: repo } : { git_ref: ref };
+      return { domain, payload, label, busy: `Fetching ${domain} from ${label}…` };
+    }
+    if (src === "upload") {
+      return {
+        domain,
+        payload: { upload_id: this._upload.upload_id },
+        label: `upload ${this._upload.label}`,
+        busy: `Checking ${this._upload.label}…`,
+      };
+    }
+    return {
+      domain,
+      payload: { version },
+      label: version,
+      busy: `Downloading Home Assistant ${version} and extracting ${domain}… this can take a minute.`,
+    };
   }
 
   _candidateKey(chosen) {
-    return `${this._source}|${chosen.domain}|${chosen.label}`;
+    return `${this._source}|${chosen.domain}|${chosen.label}|${chosen.payload.upload_id || ""}`;
   }
 
   async _pin(form) {
@@ -207,6 +224,7 @@ class IntegrationPinsPanel extends HTMLElement {
       },
       chosen.busy
     );
+    if (!r && /pick the folder again/.test(this._error || "")) this._upload = null;
     if (!r && this._errorCode === "migration_blocked") {
       this._migrationBlocked = true;
       this._render();
@@ -224,6 +242,8 @@ class IntegrationPinsPanel extends HTMLElement {
   _resetAddForm() {
     this._source = "release";
     this._gitRef = "dev";
+    this._gitRepo = CORE_REPO;
+    this._upload = null;
     this._domainInfo = null;
     this._compare = null;
     this._fieldErrors = {};
@@ -238,7 +258,7 @@ class IntegrationPinsPanel extends HTMLElement {
   async _unpin(domain) {
     const pin = this._snapshot?.pins.find((p) => p.domain === domain);
     const fate = pin && (pin.source === "pypi" || pin.source === "git")
-      ? `custom_components/${domain}/ is deleted; it came from ${pin.source === "git" ? "a commit in the core repository" : "a release on PyPI"}, so re-pinning fetches it again.`
+      ? `custom_components/${domain}/ is deleted; it came from ${pin.source === "git" ? `a commit in ${pin.git_repo || CORE_REPO}` : "a release on PyPI"}, so re-pinning fetches it again.`
       : `custom_components/${domain}/ is moved to integration_pins_retired/, since this copy exists nowhere else.`;
     if (!confirm(`Unpin ${domain}?\n\n${fate}\nThe bundled version is used after the next restart.`)) return;
     const r = await this._call({ type: "integration_pins/unpin", domain }, `Unpinning ${domain}…`);
@@ -254,10 +274,67 @@ class IntegrationPinsPanel extends HTMLElement {
       { type: "integration_pins/compare", domain: chosen.domain, ...chosen.payload },
       `Reading the file list for ${chosen.label}…`
     );
+    if (!r && /pick the folder again/.test(this._error || "")) this._upload = null;
     this._compare = r;
     this._comparedKey = r ? this._candidateKey(chosen) : null;
     if (r) this._migrationBlocked = r.migration?.verdict === "blocked";
     this._render();
+  }
+
+  /* webkitRelativePath starts with the picked folder's own name; the backend wants paths
+   * relative to the integration directory. Checked here first so picking the whole
+   * checkout fails at once instead of after uploading a hundred thousand files. */
+  async _uploadFolder(fileList) {
+    const files = [...(fileList || [])];
+    this._upload = null;
+    this._compare = null;
+    this._comparedKey = null;
+    this._pinNeedsConfirm = false;
+    this._migrationBlocked = false;
+    this._ackMigration = false;
+    this._fieldErrors = {};
+    if (!files.length) return this._render();
+    const fail = (message) => {
+      this._fieldErrors = { folder: message };
+      this._render();
+    };
+    const label = files[0].webkitRelativePath.split("/")[0];
+    const entries = files
+      .map((file) => ({ file, path: file.webkitRelativePath.split("/").slice(1).join("/") }))
+      .filter(({ path }) => path && !path.split("/").includes("__pycache__") && !path.endsWith(".pyc"));
+    const manifest = entries.find((e) => e.path === "manifest.json");
+    if (!manifest) return fail(`${label} has no manifest.json; pick the integration's own directory, not the checkout`);
+    let domain = "";
+    try {
+      domain = String(JSON.parse(await manifest.file.text()).domain || "");
+    } catch (e) {
+      return fail(`${label}/manifest.json is not valid JSON`);
+    }
+    const form = this.shadowRoot.querySelector("#add-form");
+    const typed = (form?.domain?.value || "").trim().toLowerCase();
+    if (typed && typed !== domain) return fail(`${label} is the ${domain} integration, not ${typed}`);
+    if (!typed && form?.domain) {
+      form.domain.value = domain;
+      form.domain.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    }
+    const body = new FormData();
+    body.append("domain", domain);
+    body.append("label", label);
+    for (const { file, path } of entries) body.append(`f:${path}`, file, file.name);
+    this._error = null;
+    this._busy = `Uploading ${entries.length} files from ${label}…`;
+    this._render();
+    try {
+      const resp = await this._hass.fetchWithAuth("/api/integration_pins/upload", { method: "POST", body });
+      const r = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(r.message || `HTTP ${resp.status}`);
+      this._upload = { ...r, label };
+    } catch (e) {
+      this._fieldErrors = { folder: `Upload failed: ${e.message || e}` };
+    } finally {
+      this._busy = null;
+      this._render();
+    }
   }
 
   _confirmHtml() {
@@ -291,7 +368,7 @@ class IntegrationPinsPanel extends HTMLElement {
     // certain to resolve upstream. Added and removed ones may not.
     const changedList = c.changed.length
       ? `<div><span class="muted">changed:</span> <span class="mono small">${shown(c.changed)
-          .map((f) => this._historyLink(`homeassistant/components/${c.domain}/${f}`, f, "dev", c.since))
+          .map((f) => this._historyLink(`homeassistant/components/${c.domain}/${f}`, f, this._linkRepo() === CORE_REPO ? "dev" : this._gitRef.trim() || "dev", c.since, this._linkRepo()))
           .join(" · ")}</span>${more(c.changed)}</div>`
       : "";
     return `
@@ -336,17 +413,16 @@ class IntegrationPinsPanel extends HTMLElement {
   }
 
   async _repin(pin) {
+    const git = pin.source === "git";
+    const source = git
+      ? { git_ref: pin.git_sha, ...(this._backendHas("git_repo") ? { git_repo: pin.git_repo || CORE_REPO } : {}) }
+      : { version: pin.pinned_version };
+    const from = git ? `${pin.git_repo || CORE_REPO} @ ${(pin.git_sha || "").slice(0, 7)}` : `Home Assistant ${pin.pinned_version}`;
     const r = await this._call(
-      {
-        type: "integration_pins/pin",
-        domain: pin.domain,
-        version: pin.pinned_version,
-        core_range: pin.core_range,
-        reason: pin.reason,
-      },
-      `Re-downloading ${pin.domain} from Home Assistant ${pin.pinned_version}…`
+      { type: "integration_pins/pin", domain: pin.domain, ...source, core_range: pin.core_range, reason: pin.reason },
+      `Re-fetching ${pin.domain} from ${from}…`
     );
-    if (r) this._notice = `Restored ${pin.domain} from ${pin.pinned_version}. Restart to load it.`;
+    if (r) this._notice = `Restored ${pin.domain} from ${from}. Restart to load it.`;
     this._render();
   }
 
@@ -483,8 +559,9 @@ class IntegrationPinsPanel extends HTMLElement {
   }
 
   _sourceWarningHtml() {
-    if (this._source !== "git" || !this._backendHas("git")) return "";
-    return `
+    const src = this._effectiveSource();
+    if (src === "git") {
+      return `
       <div class="warn-box">
         <ha-icon icon="mdi:source-branch"></ha-icon>
         <div>
@@ -495,36 +572,60 @@ class IntegrationPinsPanel extends HTMLElement {
           at release time — so a git pin falls back to English everywhere else.
         </div>
       </div>`;
+    }
+    if (src === "upload") {
+      return `
+      <div class="warn-box">
+        <ha-icon icon="mdi:folder-upload"></ha-icon>
+        <div>
+          An uploaded folder is whatever it holds right now; nothing checks it beyond the comparison below.
+          A checkout of core's <code>dev</code> targets the <strong>next</strong> core release, and carries
+          English translations only unless you built it. No other copy exists, so unpinning moves it to
+          <code>integration_pins_retired/</code> instead of deleting it.
+        </div>
+      </div>`;
+    }
+    return "";
   }
 
   /* GitHub has no path-filtered compare -- comparing two refs across all of core is so
    * large it refuses to render -- but its commits page does filter by path and date, so
    * a release plus the date it shipped is exactly "what changed here since then". */
-  _historyUrl(path, ref = "dev", since = "") {
-    const base = "https://github.com/home-assistant/core/commits";
+  _historyUrl(path, ref = "dev", since = "", repo = CORE_REPO) {
+    const base = `https://github.com/${repo}/commits`;
     const encoded = path.split("/").map(encodeURIComponent).join("/");
     const query = since ? `?since=${encodeURIComponent(since)}` : "";
     return `${base}/${encodeURIComponent(ref)}/${encoded}${query}`;
   }
 
-  _historyLink(path, text, ref = "dev", since = "") {
-    return `<a href="${this._historyUrl(path, ref, since)}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`;
+  _historyLink(path, text, ref = "dev", since = "", repo = CORE_REPO) {
+    return `<a href="${this._historyUrl(path, ref, since, repo)}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`;
   }
 
   _domainLinksHtml() {
     const info = this._domainInfo;
     if (!info) return "";
     const path = `homeassistant/components/${info.domain}`;
-    const version =
-      this._source === "git" ? "" : this.shadowRoot.querySelector("#add-form")?.version?.value || "";
+    const src = this._effectiveSource();
+    const repo = this._linkRepo();
+    const version = src === "release" ? this.shadowRoot.querySelector("#add-form")?.version?.value || "" : "";
     const since = version ? this._released[version] || "" : "";
-    const links = [this._historyLink(path, "latest")];
+    const latestRef = repo === CORE_REPO ? "dev" : this._gitRef.trim() || "dev";
+    const links = [this._historyLink(path, "latest", latestRef, "", repo)];
     if (since) links.push(this._historyLink(path, `changed since ${version}`, "dev", since));
     if (version) links.push(this._historyLink(path, `at ${version}`, version));
     return `<span class="muted">history:</span> ${links.join(" · ")}`;
   }
 
   _onInput(ev) {
+    if (ev.target.name === "git_repo") {
+      this._gitRepo = ev.target.value;
+      this._comparedKey = null;
+      this._pinNeedsConfirm = false;
+      this._clearFieldError("git_repo");
+      this._paintDomainAids();
+      return;
+    }
     if (ev.target.name === "git_ref") {
       this._gitRef = ev.target.value;
       this._comparedKey = null;
@@ -620,6 +721,7 @@ class IntegrationPinsPanel extends HTMLElement {
       case "source": {
         if (btn.dataset.source === this._source) return;
         this._source = btn.dataset.source;
+        this._upload = null;
         this._compare = null;
         this._migrationBlocked = false;
         this._ackMigration = false;
@@ -651,6 +753,7 @@ class IntegrationPinsPanel extends HTMLElement {
   }
 
   _onChange(ev) {
+    if (ev.target.dataset?.role === "folder") return this._uploadFolder(ev.target.files);
     if (ev.target.name === "prereleases") {
       this._prereleases = ev.target.checked;
       this._loadVersions();
@@ -721,6 +824,18 @@ class IntegrationPinsPanel extends HTMLElement {
     return (this._snapshot?.features || []).includes(feature);
   }
 
+  /* The selected source, falling back to a release when the backend cannot do it. */
+  _effectiveSource() {
+    if (this._source === "git" && this._backendHas("git")) return "git";
+    if (this._source === "upload" && this._backendHas("upload")) return "upload";
+    return "release";
+  }
+
+  /* Where history and commit links point: the fork being pinned from, else core. */
+  _linkRepo() {
+    return this._effectiveSource() === "git" ? this._gitRepo.trim() || CORE_REPO : CORE_REPO;
+  }
+
   _staleBackend() {
     if (!this._snapshot) return [];
     return PANEL_FEATURES.filter((f) => !this._backendHas(f));
@@ -759,12 +874,12 @@ class IntegrationPinsPanel extends HTMLElement {
       ? ""
       : `
         <ha-button data-action="edit" data-domain="${esc(p.domain)}" ${this._busy ? "disabled" : ""}>Edit</ha-button>
-        ${p.status === "missing" || p.status === "foreign" ? `<ha-button data-action="repin" data-domain="${esc(p.domain)}" ${this._busy ? "disabled" : ""}>Re-pin</ha-button>` : ""}
+        ${(p.status === "missing" || p.status === "foreign") && p.source !== "upload" ? `<ha-button data-action="repin" data-domain="${esc(p.domain)}" ${this._busy ? "disabled" : ""}>Re-pin</ha-button>` : ""}
         <ha-button class="danger" data-action="unpin" data-domain="${esc(p.domain)}" ${this._busy ? "disabled" : ""}>Unpin</ha-button>`;
     return `
       <div class="row ${esc(p.status)}">
-        <div class="cell"><b>${esc(p.domain)}</b>${p.source === "adopted" ? ' <span class="tag">adopted</span>' : ""}</div>
-        <div class="cell mono">${esc(p.pinned_version)}${p.source === "git" ? `<div class="small">${this._gitOrigin(p)}</div>` : ""}</div>
+        <div class="cell"><b>${esc(p.domain)}</b>${p.source === "adopted" || p.source === "upload" ? ` <span class="tag">${esc(p.source)}</span>` : ""}</div>
+        <div class="cell mono">${esc(p.pinned_version)}${p.source === "git" ? `<div class="small">${this._gitOrigin(p)}</div>` : ""}${p.source === "upload" ? `<div class="small">from ${esc(p.upload_label)}</div>` : ""}</div>
         <div class="cell mono">${esc(p.core_range || "any")}</div>
         <div class="cell"><span class="chip ${esc(p.status)}" title="${esc(STATUS_HELP[p.status] || "")}">${esc(STATUS_LABEL[p.status] || p.status)}</span></div>
         <div class="cell actions">${actions}</div>
@@ -779,8 +894,10 @@ class IntegrationPinsPanel extends HTMLElement {
   }
 
   _gitOrigin(p) {
-    const commit = `https://github.com/home-assistant/core/commit/${encodeURIComponent(p.git_sha)}`;
-    return `<span class="tag">git</span> ${esc(p.git_ref)} @ <a href="${commit}" target="_blank" rel="noopener noreferrer">${esc((p.git_sha || "").slice(0, 7))}</a>`;
+    const repo = p.git_repo || CORE_REPO;
+    const commit = `https://github.com/${repo}/commit/${encodeURIComponent(p.git_sha)}`;
+    const where = repo === CORE_REPO ? "" : `${esc(repo)} `;
+    return `<span class="tag">git</span> ${where}${esc(p.git_ref)} @ <a href="${commit}" target="_blank" rel="noopener noreferrer">${esc((p.git_sha || "").slice(0, 7))}</a>`;
   }
 
   _reqDiff(p) {
@@ -817,7 +934,8 @@ class IntegrationPinsPanel extends HTMLElement {
     const opts = this._versions.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
     const domains = this._onlyInUse && this._inUseDomains.length ? this._inUseDomains : this._domains;
     const canGit = this._backendHas("git");
-    const git = canGit && this._source === "git";
+    const canUpload = this._backendHas("upload");
+    const src = this._effectiveSource();
     return `
       <ha-card header="Pin an integration">
         <div class="card-content">
@@ -833,18 +951,32 @@ class IntegrationPinsPanel extends HTMLElement {
               <div id="domain-links" class="small"></div>
             </label>
             <label>
-              <span class="label-row">Take code from${canGit ? `
+              <span class="label-row">Take code from${canGit || canUpload ? `
                 <span class="segmented">
-                  <button type="button" data-action="source" data-source="release" class="${git ? "" : "on"}">a release</button>
-                  <button type="button" data-action="source" data-source="git" class="${git ? "on" : ""}">git</button>
+                  <button type="button" data-action="source" data-source="release" class="${src === "release" ? "on" : ""}">a release</button>
+                  ${canGit ? `<button type="button" data-action="source" data-source="git" class="${src === "git" ? "on" : ""}">git</button>` : ""}
+                  ${canUpload ? `<button type="button" data-action="source" data-source="upload" class="${src === "upload" ? "on" : ""}">a folder</button>` : ""}
                 </span>` : ""}
               </span>
-              ${git ? `
+              ${src === "git" ? `
+                ${this._backendHas("git_repo") ? `
+                <span class="control">
+                  <input name="git_repo" value="${esc(this._gitRepo)}" placeholder="${CORE_REPO}" autocomplete="off" class="mono">
+                  <span class="field-error" data-for="git_repo" hidden></span>
+                </span>` : ""}
                 <span class="control">
                   <input name="git_ref" value="${esc(this._gitRef)}" placeholder="dev" autocomplete="off" class="mono">
                   <span class="field-error" data-for="git_ref" hidden></span>
                 </span>
-                <span class="small muted">branch, tag or commit in home-assistant/core</span>
+                <span class="small muted">GitHub repository (core or a fork of it), then a branch, tag or commit</span>
+              ` : src === "upload" ? `
+                <span class="control">
+                  <input type="file" data-role="folder" webkitdirectory>
+                  <span class="field-error" data-for="folder" hidden></span>
+                </span>
+                <span class="small muted">${this._upload
+                  ? `${esc(this._upload.label)}: ${esc(this._upload.files)} files, staged as <span class="mono">${esc(this._upload.version)}</span>`
+                  : "the integration's own directory, e.g. homeassistant/components/&lt;domain&gt;"}</span>
               ` : `
                 <span class="control">
                   <select name="version" class="mono">
@@ -942,8 +1074,8 @@ class IntegrationPinsPanel extends HTMLElement {
           </div>
           <div class="muted small">
             Copies kept in <code>integration_pins_retired/</code> when an override was taken out of
-            <code>custom_components/</code>. Unpinning something pinned from PyPI deletes it instead of
-            keeping a copy, so only hand-placed code ends up here. Nothing is removed automatically.
+            <code>custom_components/</code>. Unpinning something pinned from PyPI or git deletes it instead of
+            keeping a copy, so only code that exists nowhere else — adopted or uploaded — ends up here. Nothing is removed automatically.
           </div>
         </div>
       </ha-card>`;
