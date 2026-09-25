@@ -164,10 +164,11 @@ async def async_download(session: aiohttp.ClientSession, wheel: WheelInfo, dest:
 # ---------------------------------------------------------------------------
 # GitHub
 #
-# Core, or a fork of it laid out the same way. The repository is not the release: HA generates the non-English translations at
-# build time, so a git pin ships English only. In exchange it is far cheaper than a
-# wheel -- two API calls for the commit and the integration's file list, then the
-# files themselves from raw.githubusercontent.com, which is not rate limited.
+# Core, or a fork of it laid out the same way. The repository is not the release: HA
+# generates the non-English translations at build time, so a git pin ships English
+# only. In exchange it is far cheaper than a wheel -- two API calls for the commit and
+# the integration's file list, then the files themselves from raw.githubusercontent.com,
+# which is not rate limited.
 # ---------------------------------------------------------------------------
 
 _VERSION_PARTS = ("MAJOR", "MINOR", "PATCH")
