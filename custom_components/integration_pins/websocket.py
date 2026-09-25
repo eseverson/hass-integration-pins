@@ -202,7 +202,8 @@ async def ws_update(hass, connection, msg: dict[str, Any]) -> None:
 @_wrap
 async def ws_unpin(hass, connection, msg: dict[str, Any]) -> None:
     await _manager(hass).async_unpin(msg["domain"], msg["keep_files"])
-    connection.send_result(msg["id"])
+    # callWS resolves an empty result to null, which the panel reads as a failure.
+    connection.send_result(msg["id"], {"domain": msg["domain"]})
 
 
 @websocket_api.require_admin

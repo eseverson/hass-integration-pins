@@ -151,7 +151,10 @@ async def test_pin_update_unpin_flow(
 
     # --- unpin -> directory retired, pin gone -------------------------------
     await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": FAKE_DOMAIN})
-    assert (await client.receive_json())["success"]
+    msg = await client.receive_json()
+    assert msg["success"]
+    # A non-null result is what makes the panel show its "restart to apply" notice.
+    assert msg["result"] == {"domain": FAKE_DOMAIN}
     assert not override.exists()
     assert not (tmp_path / RETIRED_DIRNAME).exists()  # pypi pins are re-downloadable
     await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
