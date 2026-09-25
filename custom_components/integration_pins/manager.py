@@ -10,9 +10,10 @@ from typing import Any
 
 from homeassistant import loader
 from homeassistant.const import __version__ as CORE_VERSION
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_call_later
 
 from . import pinner, uploads
 from .const import (
@@ -62,6 +63,7 @@ class PinManager:
         self._dependents: dict[str, list[str]] | None = None
         self._lock = asyncio.Lock()
         self.uploads = uploads.UploadStaging()
+        self._cancel_upload_sweep: CALLBACK_TYPE | None = None
         self._listeners: list[callback] = []
 
     # -- lifecycle -----------------------------------------------------------
@@ -69,6 +71,12 @@ class PinManager:
     async def async_setup(self) -> None:
         await self.store.async_load()
         await self.async_check()
+
+    @callback
+    def async_unload(self) -> None:
+        if self._cancel_upload_sweep:
+            self._cancel_upload_sweep()
+            self._cancel_upload_sweep = None
 
     @callback
     def async_add_listener(self, listener) -> callback:
@@ -223,8 +231,21 @@ class PinManager:
         uploads.validate_upload(domain, files)
         version = uploads.content_version(CORE_VERSION, files)
         upload_id = self.uploads.add(uploads.Upload(domain, label or domain, files, version))
+        self._async_schedule_upload_sweep()
         _LOGGER.info("Staged %d uploaded files from %s for %s", len(files), label, domain)
         return {"upload_id": upload_id, "domain": domain, "files": len(files), "version": version}
+
+    @callback
+    def _async_schedule_upload_sweep(self, _now: Any = None) -> None:
+        """Free each upload when it expires, rather than on the next upload or pin."""
+        if self._cancel_upload_sweep:
+            self._cancel_upload_sweep()
+        delay = self.uploads.prune()
+        self._cancel_upload_sweep = (
+            None
+            if delay is None
+            else async_call_later(self.hass, delay, self._async_schedule_upload_sweep)
+        )
 
     def _upload_for(self, upload_id: str, domain: str) -> uploads.Upload:
         upload = self.uploads.get(upload_id)

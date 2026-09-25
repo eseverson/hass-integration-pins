@@ -1633,6 +1633,30 @@ def test_staged_uploads_expire_and_the_oldest_is_evicted():
     assert staging.get(ids[-1]).domain == "sun"
 
 
+async def test_expired_uploads_are_freed_without_another_request(
+    hass: HomeAssistant, setup, hass_client
+):
+    from datetime import timedelta
+
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from homeassistant.util import dt as dt_util
+
+    from custom_components.integration_pins import uploads
+
+    staging = hass.data[DOMAIN].uploads
+    now = [0.0]
+    staging._clock = lambda: now[0]
+    await _staged(hass_client)
+    assert staging._uploads
+
+    now[0] = uploads.UPLOAD_TTL + 1
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=uploads.UPLOAD_TTL + 1))
+    await hass.async_block_till_done()
+
+    assert not staging._uploads
+
+
 async def test_compare_against_an_uploaded_folder(
     hass: HomeAssistant, setup, hass_client, hass_ws_client
 ):

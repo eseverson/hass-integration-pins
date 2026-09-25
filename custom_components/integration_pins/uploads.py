@@ -52,7 +52,7 @@ class UploadStaging:
         self._uploads: dict[str, Upload] = {}
 
     def add(self, upload: Upload) -> str:
-        self._prune()
+        self.prune()
         while len(self._uploads) >= MAX_UPLOADS:
             del self._uploads[next(iter(self._uploads))]  # oldest first: dicts keep order
         upload.created = self._clock()
@@ -61,7 +61,7 @@ class UploadStaging:
         return upload_id
 
     def get(self, upload_id: str) -> Upload:
-        self._prune()
+        self.prune()
         upload = self._uploads.get(upload_id)
         if upload is None:
             raise PinError("That upload has expired; pick the folder again")
@@ -70,10 +70,15 @@ class UploadStaging:
     def discard(self, upload_id: str) -> None:
         self._uploads.pop(upload_id, None)
 
-    def _prune(self) -> None:
-        cutoff = self._clock() - UPLOAD_TTL
+    def prune(self) -> float | None:
+        """Forget expired uploads; seconds until the next one expires, or None if none left."""
+        now = self._clock()
+        cutoff = now - UPLOAD_TTL
         for upload_id in [k for k, u in self._uploads.items() if u.created < cutoff]:
             del self._uploads[upload_id]
+        if not self._uploads:
+            return None
+        return min(u.created for u in self._uploads.values()) - cutoff
 
 
 def check_path(path: str) -> str:
