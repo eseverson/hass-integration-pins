@@ -12,7 +12,7 @@ import hashlib
 import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from aiohttp import web
@@ -80,7 +80,20 @@ def check_path(path: str) -> str:
     """A path relative to the integration directory, or PinError."""
     if not path or path.startswith("/") or "\\" in path or ".." in path.split("/"):
         raise PinError(f"Refusing a file outside the integration's directory: {path!r}")
+    if any(part in ("", ".") for part in path.split("/")):
+        raise PinError(f"Refusing {path!r}: it is not a file path")
     return path
+
+
+def check_layout(paths: Iterable[str]) -> None:
+    """No path may be both a file and a directory, or installing it fails midway."""
+    paths = set(paths)
+    for path in paths:
+        parent = path.rpartition("/")[0]
+        while parent:
+            if parent in paths:
+                raise PinError(f"Refusing {parent!r}: it is both a file and a directory")
+            parent = parent.rpartition("/")[0]
 
 
 def _is_bytecode(path: str) -> bool:
@@ -152,6 +165,7 @@ async def read_upload(request: web.Request) -> tuple[str, str, dict[str, bytes]]
 
     if not domain:
         raise PinError("No integration domain was sent with the upload")
+    check_layout(files)
     return domain, label or domain, files
 
 

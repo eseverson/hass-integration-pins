@@ -1554,9 +1554,25 @@ async def test_upload_requires_an_admin(
         (FAKE_DOMAIN, {**UPLOADED, "../evil.py": b"x"}, "outside"),
         (FAKE_DOMAIN, {**UPLOADED, "/etc/evil.py": b"x"}, "outside"),
         (FAKE_DOMAIN, {**UPLOADED, "a\\evil.py": b"x"}, "outside"),
+        (FAKE_DOMAIN, {**UPLOADED, "x/": b"x"}, "not a file path"),
+        (FAKE_DOMAIN, {**UPLOADED, "a//b.py": b"x"}, "not a file path"),
+        (FAKE_DOMAIN, {**UPLOADED, "./b.py": b"x"}, "not a file path"),
+        (FAKE_DOMAIN, {**UPLOADED, "a": b"x", "a/b.py": b"x"}, "both a file and a directory"),
         ("", UPLOADED, "No integration domain"),
     ],
-    ids=["domain_mismatch", "no_manifest", "bad_manifest", "dotdot", "absolute", "backslash", "no_domain"],
+    ids=[
+        "domain_mismatch",
+        "no_manifest",
+        "bad_manifest",
+        "dotdot",
+        "absolute",
+        "backslash",
+        "trailing_slash",
+        "empty_segment",
+        "dot_segment",
+        "file_and_dir",
+        "no_domain",
+    ],
 )
 async def test_upload_is_refused(
     hass: HomeAssistant, setup, hass_client, tmp_path, domain, files, message
