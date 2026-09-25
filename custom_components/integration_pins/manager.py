@@ -404,6 +404,15 @@ class PinManager:
                     domain, git_ref, session, acknowledge_migration, git_repo
                 )
                 source = SOURCE_GIT
+                if (
+                    existing
+                    and existing.source == SOURCE_GIT
+                    and existing.git_sha == provenance["git_sha"] == git_ref
+                    and existing.git_repo == provenance["git_repo"]
+                ):
+                    # Re-pinning at the recorded commit, as the panel's Re-pin does: keep
+                    # the branch or tag it was asked for rather than showing the sha twice.
+                    provenance["git_ref"] = existing.git_ref
             else:
                 pinned_version, provenance = await self._async_install_from_release(
                     domain, version, session, acknowledge_migration

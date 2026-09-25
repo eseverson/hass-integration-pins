@@ -868,6 +868,31 @@ async def test_pinning_from_git_records_the_commit_and_the_core_it_targets(
     assert pin["status"] == "pending"
 
 
+async def test_repinning_a_git_pin_at_its_commit_keeps_the_ref_it_was_asked_for(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock
+):
+    files = {"__init__.py": b"x", "manifest.json": b'{"domain": "sun", "requirements": []}'}
+    _mock_github_ref(aioclient_mock)
+    _mock_github_ref(aioclient_mock, ref=FAKE_SHA)
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, files)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": "dev", "core_range": ""}
+    )
+    assert (await client.receive_json())["success"]
+    # The panel's Re-pin sends the recorded commit, so a moved branch is not picked up.
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "git_ref": FAKE_SHA, "core_range": ""}
+    )
+    assert (await client.receive_json())["success"]
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    (pin,) = (await client.receive_json())["result"]["pins"]
+    assert pin["git_ref"] == "dev"
+    assert pin["git_sha"] == FAKE_SHA
+
+
 async def test_pin_needs_exactly_one_of_release_or_git_ref(
     hass: HomeAssistant, setup, hass_ws_client
 ):
