@@ -234,7 +234,11 @@ class IntegrationPinsPanel extends HTMLElement {
       },
       chosen.busy
     );
-    if (!r && /pick the folder again/.test(this._error || "")) this._upload = null;
+    // _call() has already rendered, so each change after it needs a render of its own.
+    if (!r && /pick the folder again/.test(this._error || "")) {
+      this._upload = null;
+      this._render();
+    }
     if (!r && this._errorCode === "migration_blocked") {
       this._migrationBlocked = true;
       this._render();
@@ -320,6 +324,7 @@ class IntegrationPinsPanel extends HTMLElement {
     } catch (e) {
       return fail(`${label}/manifest.json is not valid JSON`);
     }
+    if (!domain) return fail(`${label}/manifest.json has no domain`);
     const form = this.shadowRoot.querySelector("#add-form");
     const typed = (form?.domain?.value || "").trim().toLowerCase();
     if (typed && typed !== domain) return fail(`${label} is the ${domain} integration, not ${typed}`);
