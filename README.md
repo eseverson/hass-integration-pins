@@ -2,7 +2,7 @@
 
 [![Release](https://img.shields.io/github/v/release/eseverson/hass-integration-pins?style=flat-square)](https://github.com/eseverson/hass-integration-pins/releases)
 [![License](https://img.shields.io/github/license/eseverson/hass-integration-pins?style=flat-square)](LICENSE)
-[![HACS](https://img.shields.io/badge/HACS-Custom-orange.svg?style=flat-square)](https://hacs.xyz)
+[![HACS](https://img.shields.io/badge/HACS-Default-41BDF5.svg?style=flat-square)](https://hacs.xyz)
 [![Validate](https://img.shields.io/github/actions/workflow/status/eseverson/hass-integration-pins/validate.yml?branch=main&label=validate&style=flat-square)](https://github.com/eseverson/hass-integration-pins/actions/workflows/validate.yml)
 [![Tests](https://img.shields.io/github/actions/workflow/status/eseverson/hass-integration-pins/test.yml?branch=main&label=tests&style=flat-square)](https://github.com/eseverson/hass-integration-pins/actions/workflows/test.yml)
 
@@ -20,9 +20,11 @@ Nothing changes automatically on upgrade. Each pin carries a "valid for core" ra
 
 ## Install
 
-On Home Assistant 2026.11 and newer, open **Settings → Marketplace**, add this repository as a custom repository with category **Integration** (custom repositories need a GitHub connection), then install it. On older versions, do the same through HACS. Or copy `custom_components/integration_pins/` into your config directory yourself.
+Search for **Integration Pins** in **Settings → Marketplace** on Home Assistant 2026.11 and newer, or in HACS on older versions, and install it.
 
-Either way:
+If it doesn't show up yet, add this repository as a custom repository with category **Integration** (on 2026.11 and newer, custom repositories need a GitHub connection), or copy `custom_components/integration_pins/` into your config directory yourself.
+
+Then:
 
 1. Restart Home Assistant.
 2. Settings → Devices & services → Add integration → **Integration Pins**.
