@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant, callback
 
 from .const import DOMAIN, GITHUB_REPO
 from .manager import PinManager
-from .pinner import MigrationBlocked, PinError
+from .pinner import ForeignDirectoryNotConfirmed, MigrationBlocked, PinError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +29,15 @@ def _wrap(func):
             await func(hass, connection, msg)
         except MigrationBlocked as err:
             connection.send_error(msg["id"], "migration_blocked", str(err))
+        except ForeignDirectoryNotConfirmed as err:
+            connection.send_error(
+                msg["id"],
+                "foreign_directory_not_confirmed",
+                str(err),
+                translation_domain=DOMAIN,
+                translation_key="foreign_directory_not_confirmed",
+                translation_placeholders=err.placeholders,
+            )
         except PinError as err:
             connection.send_error(msg["id"], "pin_error", str(err))
         except Exception as err:  # noqa: BLE001
@@ -135,6 +144,7 @@ async def ws_versions(hass, connection, msg: dict[str, Any]) -> None:
         vol.Optional("core_range", default=""): str,
         vol.Optional("reason", default=""): str,
         vol.Optional("acknowledge_migration", default=False): bool,
+        vol.Optional("confirm_replace_foreign", default=False): bool,
     }
 )
 @websocket_api.async_response
@@ -149,6 +159,7 @@ async def ws_pin(hass, connection, msg: dict[str, Any]) -> None:
         msg["acknowledge_migration"],
         git_repo=msg["git_repo"],
         upload_id=msg["upload_id"],
+        confirm_replace_foreign=msg["confirm_replace_foreign"],
     )
     connection.send_result(msg["id"], pin.as_dict())
 
@@ -201,9 +212,9 @@ async def ws_update(hass, connection, msg: dict[str, Any]) -> None:
 @websocket_api.async_response
 @_wrap
 async def ws_unpin(hass, connection, msg: dict[str, Any]) -> None:
-    await _manager(hass).async_unpin(msg["domain"], msg["keep_files"])
+    outcome = await _manager(hass).async_unpin(msg["domain"], msg["keep_files"])
     # callWS resolves an empty result to null, which the panel reads as a failure.
-    connection.send_result(msg["id"], {"domain": msg["domain"]})
+    connection.send_result(msg["id"], {"domain": msg["domain"], "override": outcome})
 
 
 @websocket_api.require_admin

@@ -38,3 +38,6 @@ jobs:
 
       - name: Run the test suite
         run: pytest -q
+
+      - name: Run the panel tests
+        run: node --test tests/panel/*.test.mjs

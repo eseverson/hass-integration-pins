@@ -37,6 +37,8 @@ FEATURES = (
     "migration",
     "git_repo",
     "upload",
+    "unpin_keeps_replaced",
+    "confirm_replace_foreign",
 )
 
 # Where a pin's code came from.
@@ -67,6 +69,12 @@ STATUS_PENDING = "pending"  # override written, but Home Assistant still runs th
 STATUS_OUT_OF_RANGE = "out_of_range"  # override present, core version outside range
 STATUS_MISSING = "missing"  # pin recorded but override directory is gone
 STATUS_FOREIGN = "foreign"  # directory exists but is not the one we wrote
+
+# What unpinning did to custom_components/<domain> (also used by the frontend).
+OVERRIDE_DELETED = "deleted"  # our code, fetchable again
+OVERRIDE_RETIRED = "retired"  # our code, moved to RETIRED_DIRNAME since it exists nowhere else
+OVERRIDE_LEFT = "left"  # not the code this pin wrote, or keep_files: left exactly as it was
+OVERRIDE_ABSENT = "absent"  # nothing was there
 
 ISSUE_OUT_OF_RANGE = "pin_out_of_range"
 ISSUE_MISSING = "pin_missing"

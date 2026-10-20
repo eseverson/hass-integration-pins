@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import builtins
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 
 import aiohttp
@@ -154,7 +158,7 @@ async def test_pin_update_unpin_flow(
     msg = await client.receive_json()
     assert msg["success"]
     # A non-null result is what makes the panel show its "restart to apply" notice.
-    assert msg["result"] == {"domain": FAKE_DOMAIN}
+    assert msg["result"] == {"domain": FAKE_DOMAIN, "override": "deleted"}
     assert not override.exists()
     assert not (tmp_path / RETIRED_DIRNAME).exists()  # pypi pins are re-downloadable
     await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
@@ -191,6 +195,24 @@ async def test_bad_sha256_rejected(hass: HomeAssistant, setup, hass_ws_client, a
     msg = await client.receive_json()
     assert not msg["success"] and "sha256" in msg["error"]["message"]
     assert not (tmp_path / "custom_components" / FAKE_DOMAIN).exists()
+    assert not list(tmp_path.glob(".integration_pins.*"))  # the failed download is cleaned up
+
+
+async def test_a_release_pin_downloads_and_cleans_up_off_the_event_loop(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
+):
+    """A wheel is 30-50 MB. Writing it, and removing the directory it was staged in, run in
+    the executor; the autouse loop guard in conftest fails this test if either does not."""
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    assert (await client.receive_json())["success"]
+
+    assert (tmp_path / "custom_components" / FAKE_DOMAIN / "__init__.py").is_file()
+    assert not list(tmp_path.glob(".integration_pins.*"))
 
 
 async def test_adopt_and_unmanaged_listing(hass: HomeAssistant, setup, hass_ws_client, tmp_path):
@@ -385,64 +407,100 @@ async def test_domain_info_for_a_leaf_integration_has_no_dependents(
 def _write_custom_integration(root: Path, domain: str, **manifest) -> Path:
     path = root / "custom_components" / domain
     path.mkdir(parents=True, exist_ok=True)
-    (path / "manifest.json").write_text(json.dumps({"domain": domain, **manifest}))
+    (path / "manifest.json").write_text(
+        json.dumps({"domain": domain, "name": domain.title(), **manifest})
+    )
     return path
 
 
-async def test_snapshot_lists_third_party_custom_integrations(
-    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+async def _load_custom(hass: HomeAssistant, *paths: Path) -> None:
+    """Add directories to what the loader found in custom_components at startup."""
+    from homeassistant import loader
+
+    found = dict(await loader.async_get_custom_components(hass))
+    for path in paths:
+        manifest = json.loads((path / "manifest.json").read_text())
+        found[path.name] = loader.Integration(
+            hass, f"custom_components.{path.name}", path, manifest
+        )
+    hass.data[loader.DATA_CUSTOM_COMPONENTS] = found
+
+
+def _spy_on_file_access(monkeypatch) -> list[str]:
+    touched: list[str] = []
+    for module, name in ((builtins, "open"), (io, "open"), (os, "open"), (os, "stat")):
+        original = getattr(module, name)
+
+        def spy(path, *args, _original=original, **kwargs):
+            touched.append(str(path))
+            return _original(path, *args, **kwargs)
+
+        monkeypatch.setattr(module, name, spy)
+    return touched
+
+
+async def test_snapshot_lists_third_party_custom_integrations_from_the_loader(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path, monkeypatch
 ):
-    _write_custom_integration(tmp_path, "my_hack", version="0.1.0")
+    """What Home Assistant loaded, as it loaded it -- not read out of their own files."""
+    my_hack = _write_custom_integration(tmp_path, "my_hack", name="My Hack", version="0.1.0")
+    _write_custom_integration(tmp_path, "late_arrival", version="1.0.0")  # after startup
+    await _load_custom(hass, my_hack)
+    touched = _spy_on_file_access(monkeypatch)
     client = await hass_ws_client(hass)
 
     await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
     snap = (await client.receive_json())["result"]
 
     assert snap["custom_integrations"] == [
-        {"domain": "my_hack", "version": "0.1.0", "source": "unknown", "source_detail": ""}
+        {"domain": "my_hack", "name": "My Hack", "version": "0.1.0"}
     ]
+    assert not [p for p in touched if "my_hack" in Path(p).parent.parts]  # nothing inside it
 
 
-async def test_custom_integration_source_comes_from_hacs_storage(
-    hass: HomeAssistant, setup, hass_ws_client, tmp_path
-):
-    _write_custom_integration(tmp_path, "alarmo", version="1.10.5")
-    storage = tmp_path / ".storage"
+def _write_hacs_storage(root: Path, domain: str, repo: str) -> Path:
+    storage = root / ".storage"
     storage.mkdir(exist_ok=True)
-    (storage / "hacs.data").write_text(
-        json.dumps(
-            {
-                "data": {
-                    "repositories": {
-                        "1": {
-                            "full_name": "nielsfaber/alarmo",
-                            "domain": "alarmo",
-                            "installed": True,
-                        }
-                    }
-                }
-            }
-        )
+    path = storage / "hacs.data"
+    path.write_text(
+        json.dumps({"data": {"repositories": {"1": {"full_name": repo, "domain": domain}}}})
     )
+    return path
+
+
+async def test_another_integrations_storage_is_never_read(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path, monkeypatch
+):
+    """.storage belongs to the integrations that wrote it, HACS's included."""
+    alarmo = _write_custom_integration(tmp_path, "alarmo", version="1.10.5")
+    _write_custom_integration(tmp_path, "plant", version="2.0.0")  # shadows a core domain
+    _write_hacs_storage(tmp_path, "alarmo", "nielsfaber/alarmo")
+    await _load_custom(hass, alarmo)
+    touched = _spy_on_file_access(monkeypatch)
     client = await hass_ws_client(hass)
 
     await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
-    (entry,) = (await client.receive_json())["result"]["custom_integrations"]
+    snap = (await client.receive_json())["result"]
 
-    assert entry["source"] == "hacs"
-    assert entry["source_detail"] == "nielsfaber/alarmo"
+    assert snap["custom_integrations"] == [
+        {"domain": "alarmo", "name": "Alarmo", "version": "1.10.5"}
+    ]
+    (override,) = snap["unmanaged_overrides"]
+    assert override["domain"] == "plant" and "source" not in override
+    assert not [p for p in touched if ".storage" in Path(p).parts]
 
 
 async def test_custom_integration_listing_excludes_pins_and_core_shadows(
     hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
 ):
     _mock_pypi(aioclient_mock, fake_wheel)
-    _write_custom_integration(tmp_path, "hue", version="2025.11.0")  # shadows a core domain
+    hue = _write_custom_integration(tmp_path, "hue", version="2025.11.0")  # shadows a core domain
     client = await hass_ws_client(hass)
     await client.send_json_auto_id(
         {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
     )
     assert (await client.receive_json())["success"]
+    await _load_custom(hass, hue, tmp_path / "custom_components" / FAKE_DOMAIN)
 
     await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
     snap = (await client.receive_json())["result"]
@@ -464,7 +522,7 @@ async def test_unpinning_a_pypi_pin_deletes_it_rather_than_retiring(
     assert (await client.receive_json())["success"]
 
     await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": FAKE_DOMAIN})
-    assert (await client.receive_json())["success"]
+    assert (await client.receive_json())["result"]["override"] == "deleted"
 
     assert not (tmp_path / "custom_components" / FAKE_DOMAIN).exists()
     assert not (tmp_path / RETIRED_DIRNAME).exists()
@@ -483,10 +541,90 @@ async def test_unpinning_an_adopted_pin_retires_it(
     assert (await client.receive_json())["success"]
 
     await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": "hue"})
-    assert (await client.receive_json())["success"]
+    assert (await client.receive_json())["result"]["override"] == "retired"
 
     retired = list((tmp_path / RETIRED_DIRNAME).iterdir())
     assert len(retired) == 1 and retired[0].name.startswith("hue-2025.11.0-")
+
+
+def _replace_override(override: Path, how: str) -> None:
+    """What HACS, a manual copy or another tool leaves behind in a pinned directory."""
+    (override / "__init__.py").write_text("someone else's code\n")
+    if how == "no_marker":
+        (override / MARKER_FILE).unlink()
+    else:
+        marker = json.loads((override / MARKER_FILE).read_text())
+        (override / MARKER_FILE).write_text(json.dumps({**marker, "pinned_version": "2024.1.0"}))
+
+
+@pytest.mark.parametrize("how", ["no_marker", "other_marker"])
+async def test_unpinning_a_replaced_pin_leaves_the_directory_alone(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path, how
+):
+    """Only the code this pin wrote is ours to delete; anything else loses just the pin."""
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    assert (await client.receive_json())["success"]
+    override = tmp_path / "custom_components" / FAKE_DOMAIN
+    _replace_override(override, how)
+    before = {p.relative_to(override): p.read_bytes() for p in override.rglob("*") if p.is_file()}
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    (pin,) = (await client.receive_json())["result"]["pins"]
+    assert pin["status"] == "foreign"
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": FAKE_DOMAIN})
+    msg = await client.receive_json()
+
+    assert msg["result"] == {"domain": FAKE_DOMAIN, "override": "left"}
+    after = {p.relative_to(override): p.read_bytes() for p in override.rglob("*") if p.is_file()}
+    assert after == before
+    assert not (tmp_path / RETIRED_DIRNAME).exists()
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    snap = (await client.receive_json())["result"]
+    assert snap["pins"] == []
+    assert snap["restart_required"] is False  # nothing on disk changed
+
+
+async def test_unpinning_a_replaced_adopted_pin_does_not_retire_it(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+):
+    manual = _write_custom_integration(tmp_path, "hue", version="2025.11.0")
+    _mark_loaded(hass, "hue", manual)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/adopt", "domain": "hue", "pinned_version": "2025.11.0"}
+    )
+    assert (await client.receive_json())["success"]
+    _replace_override(manual, "no_marker")
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": "hue"})
+    assert (await client.receive_json())["result"]["override"] == "left"
+
+    assert (manual / "__init__.py").read_text() == "someone else's code\n"
+    assert not (tmp_path / RETIRED_DIRNAME).exists()
+
+
+def test_remove_override_checks_the_marker_itself(tmp_path, fake_wheel):
+    """The guard sits next to the rmtree, not only in the caller."""
+    override = pinner.extract_component(
+        fake_wheel, FAKE_DOMAIN, FAKE_VERSION, str(tmp_path), CORE_VERSION
+    )
+
+    assert pinner.remove_override(FAKE_DOMAIN, "2024.1.0", str(tmp_path), retire=False) == (
+        "left",
+        None,
+    )
+    assert (override / "__init__.py").is_file()
+
+    assert pinner.remove_override(FAKE_DOMAIN, FAKE_VERSION, str(tmp_path), retire=False) == (
+        "deleted",
+        None,
+    )
+    assert not override.exists()
+    assert pinner.remove_override(FAKE_DOMAIN, FAKE_VERSION, str(tmp_path)) == ("absent", None)
 
 
 async def test_snapshot_lists_retired_directories_with_sizes(
@@ -545,9 +683,24 @@ async def test_clear_retired_empties_the_folder(
     client = await hass_ws_client(hass)
 
     await client.send_json_auto_id({"type": f"{DOMAIN}/clear_retired"})
-    assert (await client.receive_json())["success"]
+    assert (await client.receive_json())["result"] == {"removed": 2}
 
     assert list(root.iterdir()) == []
+
+
+async def test_clear_retired_leaves_files_it_did_not_put_there(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+):
+    """Only directories are retired copies, and only those are listed to be cleared."""
+    root = tmp_path / RETIRED_DIRNAME
+    (root / "hue-a").mkdir(parents=True)
+    (root / "notes.txt").write_text("mine")
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/clear_retired"})
+    assert (await client.receive_json())["result"] == {"removed": 1}
+
+    assert [p.name for p in root.iterdir()] == ["notes.txt"]
 
 
 def test_parse_central_directory_matches_the_zip_it_came_from(tmp_path):
@@ -977,38 +1130,10 @@ async def test_unpinning_a_git_pin_deletes_it_rather_than_retiring(
     assert (await client.receive_json())["success"]
 
     await client.send_json_auto_id({"type": f"{DOMAIN}/unpin", "domain": FAKE_DOMAIN})
-    assert (await client.receive_json())["success"]
+    assert (await client.receive_json())["result"]["override"] == "deleted"
 
     assert not (tmp_path / "custom_components" / FAKE_DOMAIN).exists()
     assert not (tmp_path / RETIRED_DIRNAME).exists()
-
-
-async def test_unmanaged_override_reports_where_it_came_from(
-    hass: HomeAssistant, setup, hass_ws_client, tmp_path
-):
-    """A HACS integration that replaces a core domain lands here, not in the other list."""
-    _write_custom_integration(tmp_path, "plant", version="2.0.0")
-    storage = tmp_path / ".storage"
-    storage.mkdir(exist_ok=True)
-    (storage / "hacs.data").write_text(
-        json.dumps(
-            {
-                "data": {
-                    "repositories": {
-                        "7": {"full_name": "Olen/homeassistant-plant", "domain": "plant"}
-                    }
-                }
-            }
-        )
-    )
-    client = await hass_ws_client(hass)
-
-    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
-    (override,) = (await client.receive_json())["result"]["unmanaged_overrides"]
-
-    assert override["domain"] == "plant"
-    assert override["source"] == "hacs"
-    assert override["source_detail"] == "Olen/homeassistant-plant"
 
 
 async def test_snapshot_advertises_what_this_backend_can_do(
@@ -1027,6 +1152,8 @@ async def test_snapshot_advertises_what_this_backend_can_do(
     assert "git" in snap["features"]
     assert "git_repo" in snap["features"]
     assert "upload" in snap["features"]
+    assert "confirm_replace_foreign" in snap["features"]
+    assert "unpin_keeps_replaced" in snap["features"]
 
 
 async def test_version_listing_carries_release_dates(
@@ -1553,6 +1680,30 @@ async def test_upload_version_follows_the_content(hass: HomeAssistant, setup, ha
     assert first["upload_id"] != same["upload_id"]
 
 
+async def test_upload_is_hashed_off_the_event_loop(
+    hass: HomeAssistant, setup, hass_client, monkeypatch
+):
+    """An upload can be 20 MB; hashing it for the version must not stall the loop."""
+    from custom_components.integration_pins import uploads
+
+    on_loop: list[bool] = []
+    original = uploads.content_version
+
+    def spy(*args):
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        return original(*args)
+
+    monkeypatch.setattr(uploads, "content_version", spy)
+
+    await _staged(hass_client)
+
+    assert on_loop == [False]
+
+
 async def test_upload_drops_bytecode(hass: HomeAssistant, setup, hass_client):
     staged = await _staged(
         hass_client,
@@ -1822,3 +1973,149 @@ def test_repair_advice_covers_uploaded_pins(issue):
     for name in ("strings.json", "translations/en.json"):
         text = json.loads((root / name).read_text())["issues"][issue]["description"]
         assert "pick its folder again" in text, name
+
+
+# ---------------------------------------------------------------------------
+# Pinning over a directory this integration did not write
+# ---------------------------------------------------------------------------
+
+
+async def _foreign_sun(hass: HomeAssistant, tmp_path: Path) -> Path:
+    """custom_components/sun put there by something else, as the loader found it."""
+    path = _write_custom_integration(tmp_path, FAKE_DOMAIN, name="Sun Plus", version="3.1.0")
+    (path / "__init__.py").write_text("someone else's code\n")
+    await _load_custom(hass, path)
+    return path
+
+
+def _files(path: Path) -> dict:
+    return {p.relative_to(path): p.read_bytes() for p in path.rglob("*") if p.is_file()}
+
+
+async def test_pinning_over_a_foreign_directory_is_refused_until_confirmed(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
+):
+    foreign = await _foreign_sun(hass, tmp_path)
+    before = _files(foreign)
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    msg = await client.receive_json()
+
+    assert msg["error"]["code"] == "foreign_directory_not_confirmed"
+    assert msg["error"]["translation_placeholders"] == {
+        "domain": FAKE_DOMAIN,
+        "name": "Sun Plus",
+        "version": "3.1.0",
+        "retired_dir": RETIRED_DIRNAME,
+    }
+    assert _files(foreign) == before
+    assert not (tmp_path / RETIRED_DIRNAME).exists()
+    assert not any(url.path.endswith(".whl") for _, url, _, _ in aioclient_mock.mock_calls)
+
+
+async def test_a_confirmed_pin_moves_the_foreign_directory_aside(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
+):
+    foreign = await _foreign_sun(hass, tmp_path)
+    before = _files(foreign)
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {
+            "type": f"{DOMAIN}/pin",
+            "domain": FAKE_DOMAIN,
+            "version": FAKE_VERSION,
+            "confirm_replace_foreign": True,
+        }
+    )
+    assert (await client.receive_json())["success"]
+
+    (retired,) = (tmp_path / RETIRED_DIRNAME).iterdir()
+    assert retired.name.startswith(f"{FAKE_DOMAIN}-replaced-")
+    assert _files(retired) == before  # moved whole, nothing deleted
+    marker = json.loads((foreign / MARKER_FILE).read_text())
+    assert marker["pinned_version"] == FAKE_VERSION
+
+
+async def test_repinning_over_our_own_override_needs_no_confirmation(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, tmp_path
+):
+    for version in (FAKE_VERSION, "2026.1.0"):
+        _mock_pypi(aioclient_mock, build_fake_wheel(tmp_path, version=version), version=version)
+    client = await hass_ws_client(hass)
+    for version in (FAKE_VERSION, "2026.1.0"):
+        await client.send_json_auto_id(
+            {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": version}
+        )
+        assert (await client.receive_json())["success"], version
+
+
+async def test_restoring_a_replaced_pin_asks_first(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
+):
+    """Re-pin over a directory that lost our marker is pinning over someone else's code."""
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    assert (await client.receive_json())["success"]
+    (tmp_path / "custom_components" / FAKE_DOMAIN / MARKER_FILE).unlink()
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    msg = await client.receive_json()
+
+    assert msg["error"]["code"] == "foreign_directory_not_confirmed"
+    # Not in the loader: the version comes from the manifest the panel already reads.
+    assert msg["error"]["translation_placeholders"]["version"] == FAKE_VERSION
+
+
+async def test_git_and_upload_pins_ask_before_replacing_too(
+    hass: HomeAssistant, setup, hass_ws_client, hass_client, aioclient_mock, tmp_path
+):
+    foreign = await _foreign_sun(hass, tmp_path)
+    before = _files(foreign)
+    _mock_github_ref(aioclient_mock)
+    _mock_github_tree(aioclient_mock, FAKE_DOMAIN, {"__init__.py": b"x", "manifest.json": b'{"domain": "sun"}'})
+    staged = await _staged(hass_client)
+    client = await hass_ws_client(hass)
+
+    for source in ({"git_ref": "dev"}, {"upload_id": staged["upload_id"]}):
+        await client.send_json_auto_id({"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, **source})
+        msg = await client.receive_json()
+        assert msg["error"]["code"] == "foreign_directory_not_confirmed", source
+
+    assert _files(foreign) == before
+
+
+async def test_compare_says_up_front_when_pinning_would_replace_a_foreign_directory(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
+):
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    empty = (await client.receive_json())["result"]
+    await _foreign_sun(hass, tmp_path)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/compare", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    occupied = (await client.receive_json())["result"]
+
+    assert empty["replaces_foreign"] is False and empty["foreign"] is None
+    assert occupied["replaces_foreign"] is True
+    assert occupied["foreign"] == {
+        "domain": FAKE_DOMAIN,
+        "name": "Sun Plus",
+        "version": "3.1.0",
+        "retired_dir": RETIRED_DIRNAME,
+    }

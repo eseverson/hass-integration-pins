@@ -21,7 +21,12 @@
     },
     "pin_foreign": {
       "title": "Override for {domain} was not written by Integration Pins",
-      "description": "`custom_components/{domain}` exists but does not carry the marker for the pin recorded here (Home Assistant {pinned_version}). Something else replaced it. Re-pin from the Integration Pins panel to restore the recorded version (for a pin uploaded from a folder, pick its folder again), or adopt the directory as-is."
+      "description": "`custom_components/{domain}` exists but does not carry the marker for the pin recorded here (Home Assistant {pinned_version}). Something else replaced it. Re-pin from the Integration Pins panel to restore the recorded version (for a pin uploaded from a folder, pick its folder again), or adopt the directory as-is. Unpinning removes only the pin and leaves the directory alone."
+    }
+  },
+  "exceptions": {
+    "foreign_directory_not_confirmed": {
+      "message": "custom_components/{domain} holds {name} {version}, which Integration Pins did not install. Pinning moves it to {retired_dir}/; confirm to go ahead."
     }
   }
 }

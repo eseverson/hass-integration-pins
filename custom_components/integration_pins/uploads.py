@@ -188,6 +188,6 @@ class UploadView(HomeAssistantView):
             return self.json_message("Integration Pins is not loaded", 404)
         try:
             domain, label, files = await read_upload(request)
-            return self.json(manager.async_stage_upload(domain, label, files))
+            return self.json(await manager.async_stage_upload(domain, label, files))
         except PinError as err:
             return self.json_message(str(err), 400)

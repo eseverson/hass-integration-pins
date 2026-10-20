@@ -18,19 +18,25 @@ import tempfile
 import zipfile
 import zlib
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import aiohttp
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 from .const import (
     GITHUB_REPO,
     GITHUB_REPO_RE,
     MARKER_FILE,
+    OVERRIDE_ABSENT,
+    OVERRIDE_DELETED,
+    OVERRIDE_LEFT,
+    OVERRIDE_RETIRED,
     PYPI_JSON_URL,
     PYPI_VERSION_URL,
     RETIRED_DIRNAME,
@@ -49,6 +55,23 @@ class PinError(HomeAssistantError):
 
 class MigrationBlocked(PinError):
     """The pinned code could not read the config entry this instance has stored."""
+
+
+class ForeignDirectoryNotConfirmed(PinError):
+    """custom_components/<domain> holds code this integration did not write.
+
+    Pinning would move it to RETIRED_DIRNAME, so it waits for the user to say so.
+    `placeholders` names what is there, for the panel's confirmation.
+    """
+
+    def __init__(self, placeholders: dict[str, str]) -> None:
+        self.placeholders = placeholders
+        what = " ".join(filter(None, (placeholders["name"], placeholders["version"])))
+        super().__init__(
+            f"custom_components/{placeholders['domain']} holds {what}, which Integration "
+            f"Pins did not install. Pinning moves it to {placeholders['retired_dir']}/; "
+            "confirm to go ahead."
+        )
 
 
 def parse_version(text: str) -> Version:
@@ -146,18 +169,31 @@ async def async_get_wheel(session: aiohttp.ClientSession, version: str) -> Wheel
     raise PinError(f"No wheel found on PyPI for Home Assistant {version}")
 
 
-async def async_download(session: aiohttp.ClientSession, wheel: WheelInfo, dest: Path) -> None:
-    """Stream the wheel to disk and verify its digest."""
+def _write_chunk(fh: BinaryIO, digest: Any, chunk: bytes) -> None:
+    fh.write(chunk)
+    digest.update(chunk)
+
+
+async def async_download(
+    hass: HomeAssistant, session: aiohttp.ClientSession, wheel: WheelInfo, dest: Path
+) -> None:
+    """Stream the wheel to disk and verify its digest.
+
+    A wheel is 30-50 MB, so opening, writing, hashing and closing the file all happen in
+    the executor; only the network reads stay on the event loop.
+    """
     digest = hashlib.sha256()
     async with session.get(wheel.url, timeout=aiohttp.ClientTimeout(total=600)) as resp:
         if resp.status != 200:
             raise PinError(f"Download failed with HTTP {resp.status}")
-        with dest.open("wb") as fh:
+        fh = await hass.async_add_executor_job(dest.open, "wb")
+        try:
             async for chunk in resp.content.iter_chunked(1 << 20):
-                fh.write(chunk)
-                digest.update(chunk)
+                await hass.async_add_executor_job(_write_chunk, fh, digest, chunk)
+        finally:
+            await hass.async_add_executor_job(fh.close)
     if wheel.sha256 and digest.hexdigest() != wheel.sha256:
-        dest.unlink(missing_ok=True)
+        await hass.async_add_executor_job(partial(dest.unlink, missing_ok=True))
         raise PinError("Downloaded wheel failed sha256 verification")
 
 
@@ -619,9 +655,31 @@ def read_marker(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def marker_matches(marker: dict[str, Any] | None, pinned_version: str) -> bool:
+    """Whether a directory's marker says it is the code a pin at this version wrote."""
+    return (
+        marker is not None
+        and marker.get("managed_by") == "integration_pins"
+        and marker.get("pinned_version") == pinned_version
+    )
+
+
 def core_requirements(domain: str) -> list[str]:
     manifest = read_manifest(core_components_dir() / domain)
     return list(manifest.get("requirements", [])) if manifest else []
+
+
+def make_download_dir(config_dir: str) -> Path:
+    """A scratch directory for a wheel, next to where its contents are going.
+
+    Not /tmp: Home Assistant OS mounts it as a tmpfs, so a 30-50 MB wheel there is 30-50 MB
+    of RAM on a small box.
+    """
+    return Path(tempfile.mkdtemp(prefix=".integration_pins.", dir=config_dir))
+
+
+def remove_download_dir(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _write_into(staging: Path, rel: str, data: bytes) -> None:
@@ -747,15 +805,22 @@ def _retire(path: Path, config_dir: str, label: str) -> Path:
 
 def remove_override(
     domain: str, pinned_version: str, config_dir: str, retire: bool = True
-) -> Path | None:
-    """Take an override out of custom_components. Returns the retired path, if kept."""
+) -> tuple[str, Path | None]:
+    """Take an override out of custom_components if it is still the code this pin wrote.
+
+    Returns what happened (one of the OVERRIDE_* values) and the retired path, if kept. A
+    directory whose marker does not match was put there by something else -- HACS, a
+    manual copy -- and is neither deleted nor moved.
+    """
     target = custom_components_dir(config_dir) / domain
     if not target.exists():
-        return None
+        return OVERRIDE_ABSENT, None
+    if not marker_matches(read_marker(target), pinned_version):
+        return OVERRIDE_LEFT, None
     if not retire:
         shutil.rmtree(target)
-        return None
-    return _retire(target, config_dir, f"{domain}-{pinned_version}")
+        return OVERRIDE_DELETED, None
+    return OVERRIDE_RETIRED, _retire(target, config_dir, f"{domain}-{pinned_version}")
 
 
 def _dir_size(path: Path) -> int:
@@ -800,16 +865,15 @@ def delete_retired(config_dir: str, name: str) -> None:
 
 
 def clear_retired(config_dir: str) -> int:
+    """Delete every retired copy: the directories list_retired shows, and nothing else."""
     root = retired_dir(config_dir)
     if not root.is_dir():
         return 0
     removed = 0
     for path in list(root.iterdir()):
-        if path.is_dir():
+        if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path)
-        else:
-            path.unlink()
-        removed += 1
+            removed += 1
     return removed
 
 
@@ -828,89 +892,12 @@ def inspect_override(domain: str, config_dir: str) -> dict[str, Any]:
     }
 
 
-_HACS_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
-
-
-def _hacs_sources(config_dir: str) -> dict[str, str]:
-    """Map domain -> HACS repository, read from HACS's own storage.
-
-    Best effort: this is HACS's private file and its shape has changed between major
-    versions, so walk it for anything that looks like a repository record instead of
-    assuming a layout, and return nothing at all if it cannot be read. Parsed results
-    are kept until the file's mtime moves, since a snapshot consults this twice and
-    the file grows with the number of repositories installed.
-    """
-    path = Path(config_dir) / ".storage" / "hacs.data"
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return {}
-    cached = _HACS_CACHE.get(str(path))
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-    sources: dict[str, str] = {}
-
-    def walk(node: Any) -> None:
-        if isinstance(node, list):
-            for item in node:
-                walk(item)
-            return
-        if not isinstance(node, dict):
-            return
-        domain = node.get("domain")
-        repo = node.get("full_name") or node.get("repository")
-        if isinstance(domain, str) and isinstance(repo, str):
-            sources.setdefault(domain, repo)
-        for value in node.values():
-            walk(value)
-
-    walk(data)
-    _HACS_CACHE[str(path)] = (mtime, sources)
-    return sources
-
-
-def _source_of(domain: str, hacs: dict[str, str]) -> dict[str, str]:
-    repo = hacs.get(domain)
-    return {"source": "hacs" if repo else "unknown", "source_detail": repo or ""}
-
-
-def list_custom_integrations(config_dir: str, exclude: set[str]) -> list[dict[str, Any]]:
-    """Third-party integrations in custom_components that do not shadow a core domain."""
-    ccdir = custom_components_dir(config_dir)
-    if not ccdir.is_dir():
-        return []
-    core = set(list_core_domains())
-    hacs = _hacs_sources(config_dir)
-    result: list[dict[str, Any]] = []
-    for path in sorted(ccdir.iterdir()):
-        if not path.is_dir() or path.name in exclude or path.name in core:
-            continue
-        manifest = read_manifest(path)
-        if manifest is None:
-            continue
-        result.append(
-            {
-                "domain": path.name,
-                "version": manifest.get("version"),
-                **_source_of(path.name, hacs),
-            }
-        )
-    return result
-
-
 def list_unmanaged_overrides(config_dir: str, managed: set[str]) -> list[dict[str, Any]]:
     """Custom components that shadow a core domain but are not pinned by us."""
     ccdir = custom_components_dir(config_dir)
     if not ccdir.is_dir():
         return []
     core = set(list_core_domains())
-    hacs = _hacs_sources(config_dir)
     result: list[dict[str, Any]] = []
     for path in sorted(ccdir.iterdir()):
         if not path.is_dir() or path.name in managed or path.name not in core:
@@ -923,7 +910,6 @@ def list_unmanaged_overrides(config_dir: str, managed: set[str]) -> list[dict[st
                 "domain": path.name,
                 "manifest_version": manifest.get("version"),
                 "marker": read_marker(path),
-                **_source_of(path.name, hacs),
             }
         )
     return result

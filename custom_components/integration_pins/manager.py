@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import tempfile
-from pathlib import Path
 from typing import Any
 
 from homeassistant import loader
@@ -21,6 +19,10 @@ from .const import (
     FEATURES,
     GITHUB_REPO,
     MARKER_FILE,
+    OVERRIDE_DELETED,
+    OVERRIDE_LEFT,
+    OVERRIDE_RETIRED,
+    RETIRED_DIRNAME,
     SOURCE_GIT,
     SOURCE_PYPI,
     SOURCE_UPLOAD,
@@ -33,7 +35,7 @@ from .const import (
     STATUS_OUT_OF_RANGE,
     STATUS_PENDING,
 )
-from .pinner import MigrationBlocked, PinError
+from .pinner import ForeignDirectoryNotConfirmed, MigrationBlocked, PinError
 from .store import Pin, PinStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -118,9 +120,8 @@ class PinManager:
         unmanaged = await self.hass.async_add_executor_job(
             pinner.list_unmanaged_overrides, config_dir, set(self.store.pins)
         )
-        custom = await self.hass.async_add_executor_job(
-            pinner.list_custom_integrations, config_dir, set(self.store.pins) | {DOMAIN}
-        )
+        core_domains = set(await self.async_core_domains())
+        custom = self._custom_integrations(loaded, core_domains | set(self.store.pins) | {DOMAIN})
         retired = await self.hass.async_add_executor_job(pinner.list_retired, config_dir)
         return {
             "core_version": CORE_VERSION,
@@ -132,6 +133,22 @@ class PinManager:
             "custom_integrations": custom,
             "retired": retired,
         }
+
+    @staticmethod
+    def _custom_integrations(
+        loaded: dict[str, loader.Integration], exclude: set[str]
+    ) -> list[dict[str, Any]]:
+        """Third-party integrations that do not shadow a core domain, as the loader found
+        them at startup, rather than read out of their own directories."""
+        return [
+            {
+                "domain": domain,
+                "name": integration.name,
+                "version": str(integration.version) if integration.version else None,
+            }
+            for domain, integration in sorted(loaded.items())
+            if domain not in exclude
+        ]
 
     async def async_core_domains(self) -> list[str]:
         return await self.hass.async_add_executor_job(pinner.list_core_domains)
@@ -212,8 +229,11 @@ class PinManager:
 
         base, compared_with = await self._async_baseline(domain, session)
         result = pinner.compare_digests(base, candidate)
+        foreign = await self._async_foreign_override(domain)
         return {
             **result,
+            "replaces_foreign": foreign is not None,
+            "foreign": foreign,
             "domain": domain,
             "version": label,
             "compared_with": compared_with,
@@ -222,14 +242,16 @@ class PinManager:
             "identical": not (result["added"] or result["removed"] or result["changed"]),
         }
 
-    @callback
-    def async_stage_upload(
+    async def async_stage_upload(
         self, domain: str, label: str, files: dict[str, bytes]
     ) -> dict[str, Any]:
         """Hold an uploaded directory until it is compared and pinned."""
         domain = domain.strip().lower()
         uploads.validate_upload(domain, files)
-        version = uploads.content_version(CORE_VERSION, files)
+        # Up to MAX_BYTES of content to hash: the executor's job, not the event loop's.
+        version = await self.hass.async_add_executor_job(
+            uploads.content_version, CORE_VERSION, files
+        )
         upload_id = self.uploads.add(uploads.Upload(domain, label or domain, files, version))
         self._async_schedule_upload_sweep()
         _LOGGER.info("Staged %d uploaded files from %s for %s", len(files), label, domain)
@@ -292,6 +314,31 @@ class PinManager:
         digest = await self.hass.async_add_executor_job(pinner.local_component_digest, path)
         return digest, f"core {CORE_VERSION}"
 
+    async def _async_foreign_override(self, domain: str) -> dict[str, str] | None:
+        """What is in custom_components/<domain>, if pinning would replace code we did not write.
+
+        None when the directory is empty or is the override a pin of ours wrote. The name
+        and version come from what the loader found at startup, falling back to the
+        manifest version the panel already reads for overrides.
+        """
+        info = await self.hass.async_add_executor_job(
+            pinner.inspect_override, domain, self.hass.config.config_dir
+        )
+        if not info.get("present"):
+            return None
+        pin = self.store.get(domain)
+        if pin is not None and pinner.marker_matches(info.get("marker"), pin.pinned_version):
+            return None
+        integration = (await loader.async_get_custom_components(self.hass)).get(domain)
+        name = integration.name if integration else ""
+        version = integration.version if integration and integration.version else None
+        return {
+            "domain": domain,
+            "name": name,
+            "version": str(version or info.get("manifest_version") or ""),
+            "retired_dir": RETIRED_DIRNAME,
+        }
+
     @callback
     def async_migration_check(self, domain: str, files: dict[str, bytes]) -> dict[str, Any]:
         """What pinning this code would do to the config entry already stored.
@@ -351,10 +398,7 @@ class PinManager:
         """Classify a pin. `integration` is the custom integration Home Assistant loaded."""
         if not info.get("present"):
             return STATUS_MISSING
-        marker = info.get("marker") or {}
-        if marker.get("managed_by") != "integration_pins" or marker.get(
-            "pinned_version"
-        ) != pin.pinned_version:
+        if not pinner.marker_matches(info.get("marker"), pin.pinned_version):
             return STATUS_FOREIGN
         # Custom integrations are scanned once at startup, so an override written since
         # then is on disk but not running yet -- as is a re-pin over a loaded override.
@@ -376,6 +420,7 @@ class PinManager:
         acknowledge_migration: bool = False,
         git_repo: str = GITHUB_REPO,
         upload_id: str = "",
+        confirm_replace_foreign: bool = False,
     ) -> Pin:
         domain = domain.strip().lower()
         version = version.strip()
@@ -393,6 +438,11 @@ class PinManager:
                     f"'{domain}' is not a core integration in the running Home Assistant"
                 )
             existing = self.store.get(domain)
+            # Before anything is fetched: replacing someone else's directory is the user's call.
+            if not confirm_replace_foreign and (
+                foreign := await self._async_foreign_override(domain)
+            ):
+                raise ForeignDirectoryNotConfirmed(foreign)
             session = async_get_clientsession(self.hass)
             if upload_id:
                 pinned_version, provenance = await self._async_install_from_upload(
@@ -447,21 +497,16 @@ class PinManager:
         _LOGGER.info(
             "Pinning %s to Home Assistant %s (%.1f MB wheel)", domain, version, wheel.size / 1e6
         )
-        # Staged next to where it is going rather than in /tmp: Home Assistant OS mounts
-        # /tmp as a tmpfs, so a 30-50 MB wheel there is 30-50 MB of RAM on a small box.
-        with tempfile.TemporaryDirectory(
-            prefix=".integration_pins.", dir=self.hass.config.config_dir
-        ) as tmp:
-            wheel_path = Path(tmp) / f"homeassistant-{version}.whl"
-            await pinner.async_download(session, wheel, wheel_path)
+        config_dir = self.hass.config.config_dir
+        tmp = await self.hass.async_add_executor_job(pinner.make_download_dir, config_dir)
+        try:
+            wheel_path = tmp / f"homeassistant-{version}.whl"
+            await pinner.async_download(self.hass, session, wheel, wheel_path)
             await self.hass.async_add_executor_job(
-                pinner.extract_component,
-                wheel_path,
-                domain,
-                version,
-                self.hass.config.config_dir,
-                CORE_VERSION,
+                pinner.extract_component, wheel_path, domain, version, config_dir, CORE_VERSION
             )
+        finally:
+            await self.hass.async_add_executor_job(pinner.remove_download_dir, tmp)
         return version, {}
 
     async def _async_install_from_git(
@@ -556,31 +601,43 @@ class PinManager:
         await self.async_check()
         return pin
 
-    async def async_unpin(self, domain: str, keep_files: bool = False) -> None:
+    async def async_unpin(self, domain: str, keep_files: bool = False) -> str:
+        """Remove a pin, and its override if that is still the code it wrote.
+
+        Returns what happened to custom_components/<domain>, as an OVERRIDE_* value.
+        """
         pin = self.store.get(domain)
         if pin is None:
             raise PinError(f"No pin for '{domain}'")
+        outcome = OVERRIDE_LEFT
         async with self._lock:
             if not keep_files:
                 # PyPI and git pins record where they came from, so the files can be fetched
                 # again; adopted and uploaded ones exist nowhere else.
                 keep_a_copy = pin.source not in (SOURCE_PYPI, SOURCE_GIT)
-                retired = await self.hass.async_add_executor_job(
+                outcome, retired = await self.hass.async_add_executor_job(
                     pinner.remove_override,
                     domain,
                     pin.pinned_version,
                     self.hass.config.config_dir,
                     keep_a_copy,
                 )
-                if retired:
+                if outcome == OVERRIDE_RETIRED:
                     _LOGGER.info("Retired override for %s to %s", domain, retired)
-                else:
-                    _LOGGER.info("Deleted override for %s (re-pinnable from PyPI)", domain)
-                self._removal_pending = True
+                elif outcome == OVERRIDE_DELETED:
+                    _LOGGER.info("Deleted override for %s (re-pinnable from its source)", domain)
+                elif outcome == OVERRIDE_LEFT:
+                    _LOGGER.info(
+                        "custom_components/%s is not the code this pin wrote; left it in place",
+                        domain,
+                    )
+                if outcome != OVERRIDE_LEFT:
+                    self._removal_pending = True
             await self.store.async_remove(domain)
         for issue in (ISSUE_OUT_OF_RANGE, ISSUE_MISSING, ISSUE_FOREIGN):
             ir.async_delete_issue(self.hass, DOMAIN, f"{issue}_{domain}")
         await self.async_check()
+        return outcome
 
     async def async_delete_retired(self, name: str) -> None:
         await self.hass.async_add_executor_job(

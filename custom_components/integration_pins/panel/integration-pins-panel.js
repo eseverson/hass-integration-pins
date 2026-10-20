@@ -9,7 +9,7 @@
  * it only changes when Home Assistant restarts. Anything the running backend does not
  * advertise is hidden, and the page says why, instead of sending a request its older
  * websocket schema would reject with a validation error. */
-const PANEL_FEATURES = ["in_use", "domain_info", "compare", "git", "retired", "custom_integrations", "git_repo", "upload"];
+const PANEL_FEATURES = ["in_use", "domain_info", "compare", "git", "retired", "custom_integrations", "git_repo", "upload", "confirm_replace_foreign"];
 const CORE_REPO = "home-assistant/core";
 
 /* owner/name from what was typed or pasted, as pinner.normalize_repo reads it; empty
@@ -37,7 +37,8 @@ const STATUS_HELP = {
   out_of_range:
     "Override is still loaded, but the running core is outside the range you set. Verify it, then widen the range or unpin.",
   missing: "Pin is recorded but custom_components/<domain> is gone; the bundled version is running.",
-  foreign: "custom_components/<domain> exists but was not written by this pin (marker mismatch).",
+  foreign:
+    "custom_components/<domain> exists but was not written by this pin (marker mismatch). Unpinning removes only the pin and leaves the directory alone.",
 };
 
 const fmtBytes = (n) => {
@@ -49,6 +50,79 @@ const fmtBytes = (n) => {
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+/* Home Assistant's Marketplace (2026.11+) installs integrations into custom_components and
+ * can say which. Only that is used to label a row; without it there is no attribution at all.
+ * The panel asks it directly, so the backend never depends on it. */
+const MARKETPLACE_TIMEOUT_MS = 5000;
+const DOMAIN_RE = /^[a-z0-9_]+$/;
+const FULL_NAME_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+
+/* domain -> owner/name of each integration the Marketplace says it installed. Anything not
+ * shaped as expected is skipped, so a changed response gives no label rather than a wrong one. */
+export const marketplaceInstalled = (repos) => {
+  const installed = {};
+  if (!Array.isArray(repos)) return installed;
+  for (const r of repos) {
+    if (!r || typeof r !== "object" || r.installed !== true) continue;
+    if (r.category !== undefined && r.category !== "integration") continue;
+    const { domain, full_name: fullName, local_path: localPath } = r;
+    if (typeof domain !== "string" || !DOMAIN_RE.test(domain)) continue;
+    if (typeof fullName !== "string" || !FULL_NAME_RE.test(fullName)) continue;
+    // The files must be the ones in this row: custom_components/<domain>.
+    if (typeof localPath !== "string" || !localPath.replace(/\/+$/, "").endsWith(`custom_components/${domain}`)) continue;
+    installed[domain] = fullName;
+  }
+  return installed;
+};
+
+let marketplaceLogged = false;
+
+/* Ask the Marketplace, if this Home Assistant has one. Never throws and never waits long:
+ * an unknown command, a non-admin user, an error or no answer all mean no labels. */
+export const fetchMarketplaceInstalled = async (hass, timeoutMs = MARKETPLACE_TIMEOUT_MS) => {
+  const components = hass?.config?.components;
+  if (!Array.isArray(components) || !components.includes("marketplace")) return {};
+  let timer;
+  try {
+    const repos = await Promise.race([
+      Promise.resolve().then(() =>
+        hass.callWS({ type: "marketplace/repositories/list", categories: ["integration"] })
+      ),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("no answer")), timeoutMs);
+      }),
+    ]);
+    return marketplaceInstalled(repos);
+  } catch (e) {
+    if (!marketplaceLogged) {
+      marketplaceLogged = true;
+      console.debug("Integration Pins: no Marketplace labels:", e?.message || e);
+    }
+    return {};
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/* What a pin would move aside: custom_components/<domain> holding code the panel did not
+ * install. Takes Compare's answer, or the placeholders of the backend's refusal. */
+export const foreignTarget = (source) => {
+  const candidate = source && "replaces_foreign" in source ? (source.replaces_foreign === true ? source.foreign : null) : source;
+  return candidate && typeof candidate === "object" && typeof candidate.domain === "string" && DOMAIN_RE.test(candidate.domain)
+    ? candidate
+    : null;
+};
+
+export const foreignConfirmText = (foreign, marketplaceRepo = "") => {
+  const what = [foreign.name || foreign.domain, foreign.version].filter(Boolean).join(" ");
+  const retired = foreign.retired_dir || "integration_pins_retired";
+  let text = `custom_components/${foreign.domain}/ holds ${what}, which this panel did not install.\n\n` +
+    `Pinning moves it to ${retired}/ and puts the pinned code in its place; nothing is deleted.`;
+  if (marketplaceRepo)
+    text += `\n\nThe Marketplace installed it from ${marketplaceRepo} and manages it, so it would also try to update that directory.`;
+  return `${text}\n\nPin over it?`;
+};
 
 class IntegrationPinsPanel extends HTMLElement {
   constructor() {
@@ -69,6 +143,7 @@ class IntegrationPinsPanel extends HTMLElement {
     this._fieldErrors = {}; // field name -> message, shown against the input itself
     this._resetting = false; // set for one render, to drop the values instead of keeping them
     this._errorCode = null; // websocket error code of the last failed call
+    this._errorData = null; // its translation placeholders, when it sent any
     this._migrationBlocked = false; // the pin cannot read this instance's stored config entry
     this._ackMigration = false;
     this._comparedKey = null; // what the visible comparison was actually run against
@@ -83,6 +158,7 @@ class IntegrationPinsPanel extends HTMLElement {
     this._adopting = null; // domain currently being adopted
     this._unsub = null;
     this._rendered = false;
+    this._marketplace = {}; // domain -> owner/name the Marketplace installed it from
   }
 
   set hass(hass) {
@@ -110,6 +186,7 @@ class IntegrationPinsPanel extends HTMLElement {
 
   async _connect() {
     this._render();
+    this._loadMarketplace();
     try {
       this._unsub = this._hass.connection.subscribeMessage(
         (snap) => {
@@ -148,6 +225,7 @@ class IntegrationPinsPanel extends HTMLElement {
   async _call(msg, busyText) {
     this._error = null;
     this._errorCode = null;
+    this._errorData = null;
     this._notice = null;
     this._busy = busyText;
     this._render();
@@ -157,6 +235,7 @@ class IntegrationPinsPanel extends HTMLElement {
     } catch (e) {
       this._error = e.message || String(e);
       this._errorCode = e.code || null;
+      this._errorData = e.translation_placeholders || null;
       return null;
     } finally {
       this._busy = null;
@@ -223,7 +302,7 @@ class IntegrationPinsPanel extends HTMLElement {
       this._render();
       return;
     }
-    const r = await this._call(
+    const r = await this._sendPin(
       {
         type: "integration_pins/pin",
         domain: chosen.domain,
@@ -232,7 +311,8 @@ class IntegrationPinsPanel extends HTMLElement {
         reason: form.reason.value.trim(),
         acknowledge_migration: this._ackMigration,
       },
-      chosen.busy
+      chosen.busy,
+      foreignTarget(this._compare)
     );
     // _call() has already rendered, so each change after it needs a render of its own.
     if (!r && /pick the folder again/.test(this._error || "")) {
@@ -247,6 +327,45 @@ class IntegrationPinsPanel extends HTMLElement {
       this._notice = `Pinned ${chosen.domain} to ${r.pinned_version}. Restart Home Assistant to load it.`;
       this._resetAddForm();
     }
+  }
+
+  /* Send a pin, asking first when it would move aside a directory this panel did not
+   * install: up front when Compare said so, on the commit press, or when the backend
+   * refuses because it found one (Re-pin, or something appeared since the comparison). */
+  async _sendPin(msg, busy, foreign) {
+    const confirmable = this._backendHas("confirm_replace_foreign");
+    if (foreign && confirmable) {
+      if (!confirm(foreignConfirmText(foreign, this._marketplace[foreign.domain]))) return this._pinDeclined(foreign);
+      msg = { ...msg, confirm_replace_foreign: true };
+    }
+    let r = await this._call(msg, busy);
+    const refused = foreignTarget(this._errorData);
+    if (!r && this._errorCode === "foreign_directory_not_confirmed" && refused && !msg.confirm_replace_foreign) {
+      if (!confirm(foreignConfirmText(refused, this._marketplace[refused.domain]))) return this._pinDeclined(refused);
+      r = await this._call({ ...msg, confirm_replace_foreign: true }, busy);
+    }
+    return r;
+  }
+
+  _pinDeclined(foreign) {
+    this._error = null;
+    this._errorCode = null;
+    this._notice = `Not pinned: custom_components/${foreign.domain}/ was left as it is.`;
+    this._render();
+    return null;
+  }
+
+  _foreignHtml() {
+    const foreign = foreignTarget(this._compare);
+    if (!foreign) return "";
+    const what = [foreign.name || foreign.domain, foreign.version].filter(Boolean).join(" ");
+    const mp = this._marketplace[foreign.domain];
+    return `
+      <div class="warn-box">
+        <ha-icon icon="mdi:folder-swap-outline"></ha-icon>
+        <div><code>custom_components/${esc(foreign.domain)}/</code> holds ${esc(what)}, which this panel did not install.
+        Pinning asks first, then moves it to <code>${esc(foreign.retired_dir || "integration_pins_retired")}/</code>.${mp ? ` The Marketplace manages it (${esc(mp)}) and would also try to update it.` : ""}</div>
+      </div>`;
   }
 
   /* Reset the state the form renders from, not the form element: _call() re-renders
@@ -271,12 +390,25 @@ class IntegrationPinsPanel extends HTMLElement {
 
   async _unpin(domain) {
     const pin = this._snapshot?.pins.find((p) => p.domain === domain);
-    const fate = pin && (pin.source === "pypi" || pin.source === "git")
-      ? `custom_components/${domain}/ is deleted; it came from ${pin.source === "git" ? `a commit in ${pin.git_repo || CORE_REPO}` : "a release on PyPI"}, so re-pinning fetches it again.`
-      : `custom_components/${domain}/ is moved to integration_pins_retired/, since this copy exists nowhere else.`;
-    if (!confirm(`Unpin ${domain}?\n\n${fate}\nThe bundled version is used after the next restart.`)) return;
+    let fate;
+    if (pin?.status === "foreign" && this._backendHas("unpin_keeps_replaced")) {
+      // The backend checks the marker again and leaves anything it did not write alone.
+      fate = `custom_components/${domain}/ is no longer the code this pin wrote, so it is left exactly as it is — nothing is deleted or moved. Only the pin is removed, and Home Assistant keeps loading that directory until you remove it yourself.`;
+    } else {
+      fate = pin?.status === "missing"
+        ? `custom_components/${domain}/ is already gone, so only the pin is removed.`
+        : pin && (pin.source === "pypi" || pin.source === "git")
+          ? `custom_components/${domain}/ is deleted; it came from ${pin.source === "git" ? `a commit in ${pin.git_repo || CORE_REPO}` : "a release on PyPI"}, so re-pinning fetches it again.`
+          : `custom_components/${domain}/ is moved to integration_pins_retired/, since this copy exists nowhere else.`;
+      fate += "\nThe bundled version is used after the next restart.";
+    }
+    if (!confirm(`Unpin ${domain}?\n\n${fate}`)) return;
     const r = await this._call({ type: "integration_pins/unpin", domain }, `Unpinning ${domain}…`);
-    if (r !== null) this._notice = `Unpinned ${domain}. Restart Home Assistant to apply.`;
+    if (r !== null) {
+      this._notice = r.override === "left"
+        ? `Unpinned ${domain}. custom_components/${domain}/ was left in place.`
+        : `Unpinned ${domain}. Restart Home Assistant to apply.`;
+    }
     this._render();
   }
 
@@ -433,9 +565,10 @@ class IntegrationPinsPanel extends HTMLElement {
       ? { git_ref: pin.git_sha, ...(this._backendHas("git_repo") ? { git_repo: pin.git_repo || CORE_REPO } : {}) }
       : { version: pin.pinned_version };
     const from = git ? `${pin.git_repo || CORE_REPO} @ ${(pin.git_sha || "").slice(0, 7)}` : `Home Assistant ${pin.pinned_version}`;
-    const r = await this._call(
+    const r = await this._sendPin(
       { type: "integration_pins/pin", domain: pin.domain, ...source, core_range: pin.core_range, reason: pin.reason },
-      `Re-fetching ${pin.domain} from ${from}…`
+      `Re-fetching ${pin.domain} from ${from}…`,
+      null
     );
     if (r) this._notice = `Restored ${pin.domain} from ${from}. Restart to load it.`;
     this._render();
@@ -471,7 +604,28 @@ class IntegrationPinsPanel extends HTMLElement {
   }
 
   async _refresh() {
+    this._loadMarketplace();
     await this._call({ type: "integration_pins/check" }, "Checking…");
+  }
+
+  /* In the background: the rest of the panel never waits on the Marketplace. */
+  async _loadMarketplace() {
+    const installed = await fetchMarketplaceInstalled(this._hass);
+    if (JSON.stringify(installed) === JSON.stringify(this._marketplace)) return;
+    this._marketplace = installed;
+    this._render();
+  }
+
+  _marketplaceBadge(domain) {
+    const fullName = this._marketplace[domain];
+    if (!fullName) return "";
+    return `<span class="mp-label"><span class="chip marketplace">Installed by Marketplace</span>
+      <a href="https://github.com/${esc(fullName)}" target="_blank" rel="noreferrer" class="mono">${esc(fullName).replace("/", "/<wbr>")}</a></span>`;
+  }
+
+  /* Where an integration came from, when something can tell: only the Marketplace can, today. */
+  _sourceCell(domain) {
+    return this._marketplace[domain] ? this._marketplaceBadge(domain) : `<span class="muted small">unknown</span>`;
   }
 
   // ---- rendering ---------------------------------------------------------
@@ -510,6 +664,7 @@ class IntegrationPinsPanel extends HTMLElement {
         this._domainWarningHtml(),
         this._migrationHtml(),
         this._compareHtml(),
+        this._foreignHtml(),
         this._confirmHtml(),
       ]
         .filter(Boolean)
@@ -828,7 +983,8 @@ class IntegrationPinsPanel extends HTMLElement {
           How it works: Home Assistant loads <code>custom_components/&lt;domain&gt;</code> in
           preference to the bundled integration of the same name. Pinning extracts that
           integration from the chosen release's wheel on PyPI into <code>custom_components/</code>.
-          Unpinning moves it to <code>integration_pins_retired/</code>. Nothing is ever changed automatically
+          Unpinning deletes it, or moves it to <code>integration_pins_retired/</code> when it exists nowhere
+          else, and never touches a directory this integration did not write. Nothing is ever changed automatically
           on upgrade: if the running core leaves a pin's range you get a Repair warning and the pinned
           code keeps running until you act.
         </p>
@@ -1028,17 +1184,15 @@ class IntegrationPinsPanel extends HTMLElement {
     if (!snap.unmanaged_overrides.length) return "";
     const rows = snap.unmanaged_overrides.map((o) => {
       const adopting = this._adopting === o.domain;
-      const hacs = o.source === "hacs";
       return `
         <div class="row">
           <div class="cell"><b>${esc(o.domain)}</b></div>
           <div class="cell mono">${esc(o.manifest_version || "?")}</div>
-          <div class="cell">${hacs
-            ? `<span class="chip hacs">HACS</span> <span class="mono small">${esc(o.source_detail)}</span>`
-            : `<span class="muted small">unknown</span>`}</div>
-          <div class="cell muted small">${hacs
-            ? `HACS installs and updates this. Adopting it would put two things in charge of the same directory — leave it to HACS unless you have uninstalled it there.`
-            : `custom_components/${esc(o.domain)} shadows the bundled integration but is not managed here.`}</div>
+          <div class="cell source">${this._sourceCell(o.domain)}</div>
+          <div class="cell advice muted small">${this._marketplace[o.domain]
+            ? `custom_components/${esc(o.domain)} shadows the bundled integration. The Marketplace installed it and keeps it up to date — leave it there: adopting it would put two things in charge of the same directory.`
+            : `custom_components/${esc(o.domain)} shadows the bundled integration but is not managed here.
+            If HACS or another tool installed it, leave it there: adopting it would put two things in charge of the same directory.`}</div>
           <div class="cell actions">${adopting ? "" : `<ha-button data-action="adopt" data-domain="${esc(o.domain)}">Adopt</ha-button>`}</div>
           ${adopting ? `
             <div class="detail">
@@ -1057,7 +1211,7 @@ class IntegrationPinsPanel extends HTMLElement {
     return `
       <ha-card header="Other core overrides in custom_components">
         <div class="card-content">
-          <div class="table">
+          <div class="table cols-5">
             <div class="thead"><div>Integration</div><div>Version</div><div>Source</div><div></div><div></div></div>
             ${rows}
           </div>
@@ -1101,11 +1255,9 @@ class IntegrationPinsPanel extends HTMLElement {
     if (!items.length) return "";
     const rows = items.map((c) => `
         <div class="row">
-          <div class="cell"><b>${esc(c.domain)}</b></div>
+          <div class="cell"><b>${esc(c.name || c.domain)}</b>${c.name && c.name !== c.domain ? ` <span class="mono small muted">${esc(c.domain)}</span>` : ""}</div>
           <div class="cell mono">${esc(c.version || "?")}</div>
-          <div class="cell">${c.source === "hacs"
-            ? `<span class="chip hacs">HACS</span> <span class="mono small">${esc(c.source_detail)}</span>`
-            : `<span class="muted small">unknown</span>`}</div>
+          <div class="cell source">${this._sourceCell(c.domain)}</div>
         </div>`).join("");
     return `
       <ha-card header="Other custom integrations">
@@ -1115,9 +1267,8 @@ class IntegrationPinsPanel extends HTMLElement {
             ${rows}
           </div>
           <div class="muted small">
-            Third-party integrations in <code>custom_components/</code> that do not shadow a core
-            domain, so nothing here is pinnable. Source is read from HACS's own storage where it is
-            available; anything HACS does not know about is listed as manual.
+            Third-party integrations Home Assistant loaded from <code>custom_components/</code> at
+            startup that do not shadow a core domain, so nothing here is pinnable.
           </div>
         </div>
       </ha-card>`;
@@ -1145,7 +1296,10 @@ class IntegrationPinsPanel extends HTMLElement {
       .alert ha-icon { --mdc-icon-size: 24px; }
       button.link { background: none; border: none; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; }
       .table { display: grid; grid-template-columns: 1.2fr 1fr 1.4fr 0.9fr auto; gap: 0; }
+      .table.cols-2 { grid-template-columns: 1.2fr 3.4fr; }
       .table.cols-3 { grid-template-columns: 1.2fr 1fr 2.4fr; }
+      .table.cols-4 { grid-template-columns: 1.2fr 1fr 2.3fr auto; }
+      .table.cols-5 { grid-template-columns: 1.2fr 0.8fr 1.6fr 2.3fr auto; }
       .thead { display: contents; }
       .thead > div { font-size: 0.8em; text-transform: uppercase; letter-spacing: .04em; color: var(--secondary-text-color); padding: 8px 8px 4px; border-bottom: 1px solid var(--divider-color); }
       .row { display: contents; }
@@ -1182,10 +1336,14 @@ class IntegrationPinsPanel extends HTMLElement {
       .ok-box ha-icon { color: var(--success-color, #43a047); flex: none; }
       .info-box { background: var(--secondary-background-color); border: 1px solid var(--divider-color); }
       .info-box ha-icon { color: var(--secondary-text-color); flex: none; }
-      .chip.hacs { background: rgba(3,155,229,.18); color: var(--info-color, #039be5); }
       .chip.pending { background: rgba(3,155,229,.2); color: var(--info-color, #039be5); }
       .chip.out_of_range { background: rgba(255,152,0,.2); color: var(--warning-color, #ff9800); }
       .chip.missing, .chip.foreign { background: rgba(219,68,55,.2); color: var(--error-color, #db4437); }
+      .chip.marketplace { background: rgba(3,155,229,.18); color: var(--info-color, #039be5); }
+      .mp-label { line-height: 1.8; }
+      .cell.source { font-size: 0.85em; overflow-wrap: break-word; min-width: 0; }
+      .mp-label a { color: var(--primary-color); text-decoration: none; }
+      .mp-label a:hover { text-decoration: underline; }
       .tag { font-size: 0.75em; padding: 1px 6px; border-radius: 4px; background: var(--secondary-background-color); }
       .tag.pinned { background: rgba(3,169,244,.15); }
       .tag.core { background: var(--secondary-background-color); text-decoration: line-through; opacity: .8; }
@@ -1205,10 +1363,13 @@ class IntegrationPinsPanel extends HTMLElement {
       .ack input { flex: none; margin: 0; }
       ha-button.danger { --mdc-theme-primary: var(--error-color); }
       @media (max-width: 800px) {
-        .table, .table.cols-3 { grid-template-columns: 1fr 1fr; }
+        .table, .table.cols-2, .table.cols-3, .table.cols-4, .table.cols-5 { grid-template-columns: 1fr 1fr; }
         .thead { display: none; }
         .row > .cell { border-top: none; }
         .row > .cell:first-child { border-top: 1px solid var(--divider-color); grid-column: 1 / -1; }
+        /* No header row on a phone: say what the cell is, and give the advice the full width. */
+        .row > .cell.source::before { content: "Source"; flex-basis: 100%; font-size: 0.85em; text-transform: uppercase; letter-spacing: .04em; color: var(--secondary-text-color); }
+        .row > .cell.advice { grid-column: 1 / -1; }
         .actions { grid-column: 1 / -1; justify-content: flex-start; }
         .inline-form { grid-template-columns: 1fr; }
       }

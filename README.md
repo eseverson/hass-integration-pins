@@ -20,7 +20,7 @@ Nothing changes automatically on upgrade. Each pin carries a "valid for core" ra
 
 ## Install
 
-Through HACS, add this repository as a custom repository with category **Integration**, then install it. Or copy `custom_components/integration_pins/` into your config directory yourself.
+On Home Assistant 2026.11 and newer, open **Settings → Marketplace**, add this repository as a custom repository with category **Integration** (custom repositories need a GitHub connection), then install it. On older versions, do the same through HACS. Or copy `custom_components/integration_pins/` into your config directory yourself.
 
 Either way:
 
@@ -47,9 +47,9 @@ When other integrations are built on the one you picked, the form says how many 
 
 **Edit** changes the range or reason. **Unpin** removes the override; restart to go back to the bundled integration. **Re-pin** appears if the override goes missing or is replaced.
 
-Unpinning deletes a pin taken from PyPI or git, since re-pinning fetches it again. An **adopted** or uploaded copy exists nowhere else, so it is kept in `integration_pins_retired/` and listed at the bottom of the panel with a Delete button.
+Unpinning deletes a pin taken from PyPI or git, since re-pinning fetches it again. An **adopted** or uploaded copy exists nowhere else, so it is kept in `integration_pins_retired/` and listed at the bottom of the panel with a Delete button. Pinning over an integration this panel didn't install asks first and moves the existing copy to `integration_pins_retired/`. A pin shown as **Replaced** no longer has this integration's code in its directory, so unpinning it removes only the pin and leaves `custom_components/<domain>/` exactly as it is.
 
-The panel also lists everything else in `custom_components/` and where it came from. Several HACS integrations replace a core one — `plant` is the usual example — and those should be left to HACS; adopting one would put two things in charge of the same directory. **Adopt** is for a copy you placed by hand, so it gets the same range checking.
+The panel also lists everything else in `custom_components/`; on Home Assistant 2026.11 and newer it marks the ones installed through the Marketplace. Several integrations from HACS or the Marketplace replace a core one — `plant` is the usual example — and those should be left to whatever installed them; adopting one would put two things in charge of the same directory. **Adopt** is for a copy you placed by hand, so it gets the same range checking.
 
 Each pin shows how its Python requirements differ from the bundled version's. If another integration needs a different version of the same library, the two can fight over it across restarts.
 
