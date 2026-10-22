@@ -12,8 +12,9 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.start import async_at_started
 
-from . import pinner, uploads
+from . import alias, pinner, uploads
 from .const import (
     DOMAIN,
     FEATURES,
@@ -28,6 +29,7 @@ from .const import (
     SOURCE_UPLOAD,
     ISSUE_FOREIGN,
     ISSUE_MISSING,
+    ISSUE_NOT_ALIASED,
     ISSUE_OUT_OF_RANGE,
     STATUS_ACTIVE,
     STATUS_FOREIGN,
@@ -54,6 +56,13 @@ def _one_source(version: str, git_ref: str, upload_id: str) -> None:
         )
 
 
+_STATUS_ISSUES = {
+    STATUS_OUT_OF_RANGE: ISSUE_OUT_OF_RANGE,
+    STATUS_MISSING: ISSUE_MISSING,
+    STATUS_FOREIGN: ISSUE_FOREIGN,
+}
+
+
 class PinManager:
     """Single instance stored in hass.data[DOMAIN]."""
 
@@ -63,9 +72,11 @@ class PinManager:
         # Set when files were removed; pending pins are derived from the loader instead.
         self._removal_pending = False
         self._dependents: dict[str, list[str]] | None = None
+        self._preimported: set[str] | None = None
         self._lock = asyncio.Lock()
         self.uploads = uploads.UploadStaging()
         self._cancel_upload_sweep: CALLBACK_TYPE | None = None
+        self._cancel_started: CALLBACK_TYPE | None = None
         self._listeners: list[callback] = []
 
     # -- lifecycle -----------------------------------------------------------
@@ -73,9 +84,19 @@ class PinManager:
     async def async_setup(self) -> None:
         await self.store.async_load()
         await self.async_check()
+        # A pin and the integrations importing from it load after this one may have, so
+        # whether they got the pinned code is only known once startup is done.
+        self._cancel_started = async_at_started(self.hass, self._async_check_at_started)
+
+    async def _async_check_at_started(self, _hass: HomeAssistant) -> None:
+        self._cancel_started = None
+        await self.async_check()
 
     @callback
     def async_unload(self) -> None:
+        if self._cancel_started:
+            self._cancel_started()
+            self._cancel_started = None
         if self._cancel_upload_sweep:
             self._cancel_upload_sweep()
             self._cancel_upload_sweep = None
@@ -113,6 +134,10 @@ class PinManager:
                     "status": status,
                     "in_range": pinner.version_in_range(CORE_VERSION, pin.core_range),
                     "override": info,
+                    # Only the running pin says anything about who imports it.
+                    "importers": alias.importers(pin.domain)
+                    if status in (STATUS_ACTIVE, STATUS_OUT_OF_RANGE)
+                    else None,
                 }
             )
         pins.sort(key=lambda p: p["domain"])
@@ -175,12 +200,16 @@ class PinManager:
         domain = domain.strip().lower()
         if self._dependents is None:
             self._dependents = await self.hass.async_add_executor_job(pinner.core_dependents)
+        if self._preimported is None:
+            self._preimported = await self.hass.async_add_executor_job(alias.preimported_domains)
         dependents = self._dependents.get(domain, [])
         in_use = self._in_use()
         return {
             "domain": domain,
             "dependents": dependents,
             "loaded_dependents": [d for d in dependents if d in in_use],
+            # Imported by bootstrap before any pin can load, so importers keep the bundled code.
+            "preimported": domain in self._preimported,
         }
 
     async def async_compare(
@@ -634,7 +663,7 @@ class PinManager:
                 if outcome != OVERRIDE_LEFT:
                     self._removal_pending = True
             await self.store.async_remove(domain)
-        for issue in (ISSUE_OUT_OF_RANGE, ISSUE_MISSING, ISSUE_FOREIGN):
+        for issue in (*_STATUS_ISSUES.values(), ISSUE_NOT_ALIASED):
             ir.async_delete_issue(self.hass, DOMAIN, f"{issue}_{domain}")
         await self.async_check()
         return outcome
@@ -660,14 +689,20 @@ class PinManager:
         for pin in snapshot["pins"]:
             domain = pin["domain"]
             status = pin["status"]
-            wanted = {
-                STATUS_OUT_OF_RANGE: ISSUE_OUT_OF_RANGE,
-                STATUS_MISSING: ISSUE_MISSING,
-                STATUS_FOREIGN: ISSUE_FOREIGN,
-            }.get(status)
-            for issue in (ISSUE_OUT_OF_RANGE, ISSUE_MISSING, ISSUE_FOREIGN):
+            wanted = {_STATUS_ISSUES.get(status)}
+            # A pin written without the alias never claimed to reach importers; one with it
+            # did, and something imported the bundled package first.
+            if pin["override"].get("alias") and pin["importers"] == alias.IMPORTERS_BUNDLED:
+                wanted.add(ISSUE_NOT_ALIASED)
+                _LOGGER.warning(
+                    "Integrations that import from %s run the bundled code beside its pin: "
+                    "homeassistant.components.%s was imported before the pin loaded",
+                    domain,
+                    domain,
+                )
+            for issue in (*_STATUS_ISSUES.values(), ISSUE_NOT_ALIASED):
                 issue_id = f"{issue}_{domain}"
-                if issue == wanted:
+                if issue in wanted:
                     ir.async_create_issue(
                         self.hass,
                         DOMAIN,

@@ -29,6 +29,7 @@ from packaging.version import InvalidVersion, Version
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
+from . import alias
 from .const import (
     GITHUB_REPO,
     GITHUB_REPO_RE,
@@ -541,8 +542,11 @@ def digest_files(files: dict[str, bytes]) -> dict[str, tuple[int, int]]:
 
 
 def local_component_digest(path: Path, ignore: set[str] | None = None) -> dict[str, tuple[int, int]]:
-    """Same digest shape, computed over an integration directory on disk."""
-    ignore = ignore or set()
+    """Same digest shape, computed over an integration directory on disk.
+
+    A pin's alias shim is left out, so a pin digests the same as the code it came from.
+    """
+    ignore = (ignore or set()) | {alias.SHIM_FILE}
     digest: dict[str, tuple[int, int]] = {}
     for file in path.rglob("*"):
         if not file.is_file() or "__pycache__" in file.parts:
@@ -554,6 +558,8 @@ def local_component_digest(path: Path, ignore: set[str] | None = None) -> dict[s
             data = file.read_bytes()
         except OSError:
             continue
+        if rel == "__init__.py":
+            data = alias.strip(data)
         digest[rel] = (zlib.crc32(data), len(data))
     return digest
 
@@ -700,7 +706,17 @@ def _finalize(
     # Custom integrations must declare a version; core manifests don't.
     manifest["version"] = version
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    install_alias(staging)
     write_marker(staging, domain, version, core_version, marker_extra)
+
+
+def install_alias(path: Path) -> None:
+    """Make integrations that import homeassistant.components.<domain> get this code."""
+    init = path / "__init__.py"
+    # Bytes in and out, so the line endings and encoding of the rest are left exactly as is.
+    source = init.read_bytes().decode("utf-8", "surrogateescape") if init.is_file() else ""
+    init.write_bytes(alias.inject(source).encode("utf-8", "surrogateescape"))
+    (path / alias.SHIM_FILE).write_text(alias.SHIM_SOURCE, encoding="utf-8")
 
 
 def _atomic_install(domain: str, config_dir: str, populate) -> Path:
@@ -886,6 +902,7 @@ def inspect_override(domain: str, config_dir: str) -> dict[str, Any]:
     return {
         "present": True,
         "marker": read_marker(path),
+        "alias": (path / alias.SHIM_FILE).is_file(),
         "manifest_version": manifest.get("version"),
         "requirements": list(manifest.get("requirements", [])),
         "core_requirements": core_requirements(domain),

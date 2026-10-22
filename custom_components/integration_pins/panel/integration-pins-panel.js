@@ -124,6 +124,25 @@ export const foreignConfirmText = (foreign, marketplaceRepo = "") => {
   return `${text}\n\nPin over it?`;
 };
 
+/* A pin written before pins carried the alias can get it by being fetched again; an
+ * upload has no source to fetch from, and adopted code is left as it was placed. */
+export const repinGivesAlias = (pin) =>
+  pin.importers === "bundled" && !pin.override?.alias && (pin.source === "pypi" || pin.source === "git");
+
+/* Said when integrations importing from a running pin's domain got the bundled copy. */
+export const importersNote = (pin) => {
+  if (pin.importers !== "bundled") return "";
+  const d = pin.domain;
+  if (pin.override?.alias)
+    return `homeassistant.components.${d} was imported before this pin loaded, so integrations that import from ${d} run the bundled code beside it.`;
+  const fix = repinGivesAlias(pin)
+    ? "Re-pin to give them the pinned code."
+    : pin.source === "upload"
+      ? "Pin its folder again to give them the pinned code."
+      : "Adopted code is left as it is, so they keep the bundled copy.";
+  return `Integrations that import from ${d} run the bundled code beside this pin. ${fix}`;
+};
+
 class IntegrationPinsPanel extends HTMLElement {
   constructor() {
     super();
@@ -662,6 +681,7 @@ class IntegrationPinsPanel extends HTMLElement {
       box.innerHTML = [
         this._sourceWarningHtml(),
         this._domainWarningHtml(),
+        this._preimportedHtml(),
         this._migrationHtml(),
         this._compareHtml(),
         this._foreignHtml(),
@@ -851,6 +871,20 @@ class IntegrationPinsPanel extends HTMLElement {
           (${esc(shown)}${esc(rest)}).
           Pinning it runs all of them against code from the release you pick, and a bad pin here
           takes them down with it.
+        </div>
+      </div>`;
+  }
+
+  _preimportedHtml() {
+    const info = this._domainInfo;
+    if (!info?.preimported) return "";
+    const d = esc(info.domain);
+    return `
+      <div class="warn-box">
+        <ha-icon icon="mdi:alert"></ha-icon>
+        <div>
+          Home Assistant imports <strong>${d}</strong> before any custom integration loads, so a pin
+          of it runs on its own: integrations that import from ${d} keep the bundled code.
         </div>
       </div>`;
   }
@@ -1045,7 +1079,7 @@ class IntegrationPinsPanel extends HTMLElement {
       ? ""
       : `
         <ha-button data-action="edit" data-domain="${esc(p.domain)}" ${this._busy ? "disabled" : ""}>Edit</ha-button>
-        ${(p.status === "missing" || p.status === "foreign") && p.source !== "upload" ? `<ha-button data-action="repin" data-domain="${esc(p.domain)}" ${this._busy ? "disabled" : ""}>Re-pin</ha-button>` : ""}
+        ${((p.status === "missing" || p.status === "foreign") && p.source !== "upload") || repinGivesAlias(p) ? `<ha-button data-action="repin" data-domain="${esc(p.domain)}" ${this._busy ? "disabled" : ""}>Re-pin</ha-button>` : ""}
         <ha-button class="danger" data-action="unpin" data-domain="${esc(p.domain)}" ${this._busy ? "disabled" : ""}>Unpin</ha-button>`;
     return `
       <div class="row ${esc(p.status)}">
@@ -1058,6 +1092,7 @@ class IntegrationPinsPanel extends HTMLElement {
           ${p.reason ? `<div><span class="muted">Reason:</span> ${esc(p.reason)}</div>` : ""}
           <div class="muted small">Pinned on ${esc((p.created || "").slice(0, 10))} while running core ${esc(p.core_at_pin || "?")}.</div>
           ${p.status !== "active" ? `<div class="small">${esc(STATUS_HELP[p.status])}</div>` : ""}
+          ${importersNote(p) ? `<div class="small warning-text">${esc(importersNote(p))}</div>` : ""}
           ${reqDiff}
           ${editing ? this._editForm(p) : ""}
         </div>
@@ -1285,6 +1320,7 @@ class IntegrationPinsPanel extends HTMLElement {
       .card-content { padding: 0 16px 16px; }
       .muted { color: var(--secondary-text-color); }
       .small { font-size: 0.85em; }
+      .warning-text { color: var(--warning-color, #ff9800); }
       .mono { font-family: var(--code-font-family, ui-monospace, SFMono-Regular, Menlo, monospace); }
       code { font-family: var(--code-font-family, ui-monospace, Menlo, monospace); background: var(--secondary-background-color); padding: 0 4px; border-radius: 3px; }
       .alert { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: var(--ha-card-border-radius, 12px); margin-bottom: 16px; }

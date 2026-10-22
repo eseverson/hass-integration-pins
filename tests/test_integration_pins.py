@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import builtins
 import hashlib
+import importlib
 import io
 import json
 import os
+import sys
+import types
 from pathlib import Path
 
 import aiohttp
@@ -18,7 +21,7 @@ from homeassistant.const import __version__ as CORE_VERSION
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
 
-from custom_components.integration_pins import pinner
+from custom_components.integration_pins import alias, pinner
 from custom_components.integration_pins.const import (
     DOMAIN,
     ISSUE_OUT_OF_RANGE,
@@ -970,7 +973,8 @@ def test_install_component_writes_the_files_manifest_version_and_marker(tmp_path
         {"git_ref": "dev", "git_sha": FAKE_SHA},
     )
 
-    assert (target / "__init__.py").read_bytes() == b"code"
+    assert alias.strip((target / "__init__.py").read_bytes()) == b"code"
+    assert (target / alias.SHIM_FILE).is_file()
     assert (target / "translations" / "en.json").is_file()
     assert json.loads((target / "manifest.json").read_text())["version"] == "2026.10.0.dev0+90258e6"
     marker = json.loads((target / MARKER_FILE).read_text())
@@ -1007,7 +1011,7 @@ async def test_pinning_from_git_records_the_commit_and_the_core_it_targets(
     assert (await client.receive_json())["success"]
 
     override = tmp_path / "custom_components" / FAKE_DOMAIN
-    assert (override / "__init__.py").read_bytes() == b"the fix that just landed"
+    assert alias.strip((override / "__init__.py").read_bytes()) == b"the fix that just landed"
     assert json.loads((override / "manifest.json").read_text())["version"] == (
         "2026.10.0.dev0+90258e6"
     )
@@ -1500,7 +1504,7 @@ async def test_pinning_from_a_fork_records_the_repository(
     assert (await client.receive_json())["success"]
 
     override = tmp_path / "custom_components" / FAKE_DOMAIN
-    assert (override / "__init__.py").read_bytes() == b"forked fix"
+    assert alias.strip((override / "__init__.py").read_bytes()) == b"forked fix"
     assert json.loads((override / MARKER_FILE).read_text())["git_repo"] == FORK
 
     await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
@@ -1603,7 +1607,7 @@ async def test_repinning_a_fork_pin_by_its_commit_refetches_from_the_fork(
     )
     repinned = (await client.receive_json())["result"]
 
-    assert (override / "__init__.py").read_bytes() == b"forked fix"
+    assert alias.strip((override / "__init__.py").read_bytes()) == b"forked fix"
     assert repinned["git_repo"] == FORK and repinned["git_sha"] == FAKE_SHA
 
 
@@ -1881,7 +1885,7 @@ async def test_pinning_an_uploaded_folder(
     pin = (await client.receive_json())["result"]
 
     override = tmp_path / "custom_components" / FAKE_DOMAIN
-    assert (override / "__init__.py").read_bytes() == b"my local fix"
+    assert alias.strip((override / "__init__.py").read_bytes()) == b"my local fix"
     assert (override / "translations" / "en.json").is_file()
     assert json.loads((override / "manifest.json").read_text())["version"] == staged["version"]
     assert json.loads((override / MARKER_FILE).read_text())["upload_label"] == "sun"
@@ -1963,7 +1967,7 @@ async def test_unpinning_an_upload_retires_it(
 
     retired = list((tmp_path / RETIRED_DIRNAME).iterdir())
     assert len(retired) == 1 and retired[0].name.startswith(f"{FAKE_DOMAIN}-")
-    assert (retired[0] / "__init__.py").read_bytes() == b"my local fix"
+    assert alias.strip((retired[0] / "__init__.py").read_bytes()) == b"my local fix"
 
 
 @pytest.mark.parametrize("issue", ["pin_missing", "pin_foreign"])
@@ -2119,3 +2123,214 @@ async def test_compare_says_up_front_when_pinning_would_replace_a_foreign_direct
         "version": "3.1.0",
         "retired_dir": RETIRED_DIRNAME,
     }
+
+
+# --- importers get the pinned code ---------------------------------------------------
+
+_PROBE = "pins_alias_probe"  # not a core domain, so nothing else ever imports either name
+
+
+@pytest.mark.parametrize(
+    ("source", "before"),
+    [
+        ('"""Doc."""\n\nfrom __future__ import annotations\n\nimport os\n', 3),
+        ('"""A docstring\n\nover lines."""\nfrom __future__ import annotations\n', 4),
+        ('"""Doc."""\n', 1),
+        ("import os\n", 0),
+        ("", 0),
+        ("x = (\n", 0),  # does not parse; it will not import either way
+        ('"""Doc."""\r\nfrom __future__ import annotations\r\nimport os\r\n', 2),
+    ],
+)
+def test_the_alias_goes_after_the_docstring_and_future_imports(source, before):
+    injected = alias.inject(source)
+
+    assert injected.splitlines(keepends=True)[before] == alias.INIT_LINE
+    assert alias.strip(injected.encode()) == source.encode()
+    if source != "x = (\n":
+        compile(injected, "__init__.py", "exec")  # a __future__ import still comes first
+
+
+@pytest.fixture
+def probe_root(tmp_path: Path):
+    """A pin of _PROBE written the way every pin is, importable as custom_components."""
+    root = tmp_path / "probe"
+    files = {
+        "__init__.py": b'"""Probe."""\n\nfrom __future__ import annotations\n\nfrom .const import VALUE\n',
+        "const.py": b'VALUE = "pinned"\n',
+        "entity.py": b"from .const import VALUE\n\n\nclass Thing:\n    value = VALUE\n",
+        "manifest.json": json.dumps({"domain": _PROBE, "name": "Probe"}).encode(),
+    }
+    pinner.install_component(files, _PROBE, "1.0.0", str(root), CORE_VERSION)
+    sys.path.insert(0, str(root))
+    yield root
+    sys.path.remove(str(root))
+    for name in [n for n in sys.modules if _PROBE in n]:
+        del sys.modules[name]
+    sys.meta_path[:] = [f for f in sys.meta_path if getattr(f, "pinned", None) != f"custom_components.{_PROBE}"]
+    import homeassistant.components as components
+
+    components.__dict__.pop(_PROBE, None)
+
+
+def test_importing_the_bundled_name_gets_the_pinned_modules(probe_root):
+    pinned = importlib.import_module(f"custom_components.{_PROBE}")
+
+    # entity is not imported by the pin itself, so this loads it fresh through the alias.
+    entity = importlib.import_module(f"homeassistant.components.{_PROBE}.entity")
+    import homeassistant.components
+
+    assert importlib.import_module(f"homeassistant.components.{_PROBE}") is pinned
+    assert getattr(homeassistant.components, _PROBE).const.VALUE == "pinned"
+    assert entity is sys.modules[f"custom_components.{_PROBE}.entity"]
+    assert entity.__name__ == entity.__spec__.name == f"custom_components.{_PROBE}.entity"
+    assert entity.Thing.value == "pinned"
+    assert alias.importers(_PROBE) == alias.IMPORTERS_PINNED
+
+
+def test_a_module_the_pin_lacks_fails_to_import_rather_than_coming_from_core(probe_root):
+    importlib.import_module(f"custom_components.{_PROBE}")
+
+    with pytest.raises(ModuleNotFoundError, match=f"custom_components.{_PROBE}.missing"):
+        importlib.import_module(f"homeassistant.components.{_PROBE}.missing")
+
+
+def test_a_bundled_package_imported_first_is_left_alone(probe_root, caplog):
+    bundled = types.ModuleType(f"homeassistant.components.{_PROBE}")
+    sys.modules[bundled.__name__] = bundled
+    finders = list(sys.meta_path)
+
+    importlib.import_module(f"custom_components.{_PROBE}")
+
+    assert sys.modules[bundled.__name__] is bundled
+    assert sys.modules[f"custom_components.{_PROBE}._integration_pins_alias"].ALIASED is False
+    assert sys.meta_path == finders
+    assert "imported before this pin loaded" in caplog.text
+    assert alias.importers(_PROBE) == alias.IMPORTERS_BUNDLED
+
+
+async def test_a_release_pin_carries_the_alias_and_still_compares_identical(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path
+):
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    assert (await client.receive_json())["success"]
+    override = tmp_path / "custom_components" / FAKE_DOMAIN
+
+    assert (override / alias.SHIM_FILE).read_text() == alias.SHIM_SOURCE
+    assert alias.INIT_LINE in (override / "__init__.py").read_text()
+    original = f'"""fake {FAKE_DOMAIN} from {FAKE_VERSION}"""\n'.encode()
+    digest = pinner.local_component_digest(override, {MARKER_FILE})
+    assert alias.SHIM_FILE not in digest
+    assert digest["__init__.py"] == pinner.digest_files({"x": original})["x"]
+
+
+async def test_adopting_leaves_the_code_as_it_was_placed(
+    hass: HomeAssistant, setup, hass_ws_client, tmp_path
+):
+    manual = tmp_path / "custom_components" / "hue"
+    manual.mkdir(parents=True)
+    (manual / "manifest.json").write_text(json.dumps({"domain": "hue", "version": "2025.11.0"}))
+    (manual / "__init__.py").write_text("hand placed\n")
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/adopt", "domain": "hue", "pinned_version": "2025.11.0", "core_range": ""}
+    )
+    assert (await client.receive_json())["success"]
+
+    assert (manual / "__init__.py").read_text() == "hand placed\n"
+    assert not (manual / alias.SHIM_FILE).exists()
+
+
+async def _running_pin_with_importers(hass, client, aioclient_mock, fake_wheel, tmp_path, monkeypatch, bundled):
+    """Pin FAKE_DOMAIN and make it the running code, with `bundled` as what importers got."""
+    _mock_pypi(aioclient_mock, fake_wheel)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    assert (await client.receive_json())["success"]
+    override = tmp_path / "custom_components" / FAKE_DOMAIN
+    _mark_loaded(hass, FAKE_DOMAIN, override)
+    pinned = types.ModuleType(f"custom_components.{FAKE_DOMAIN}")
+    monkeypatch.setitem(sys.modules, pinned.__name__, pinned)
+    monkeypatch.setitem(
+        sys.modules,
+        f"homeassistant.components.{FAKE_DOMAIN}",
+        pinned if bundled is None else bundled,
+    )
+    return override
+
+
+async def _recheck(client) -> dict:
+    await client.send_json_auto_id({"type": f"{DOMAIN}/update", "domain": FAKE_DOMAIN, "reason": "x"})
+    assert (await client.receive_json())["success"]
+    await client.send_json_auto_id({"type": f"{DOMAIN}/list"})
+    (pin,) = (await client.receive_json())["result"]["pins"]
+    return pin
+
+
+async def test_a_pin_whose_importers_got_the_bundled_code_raises_a_repair(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path, monkeypatch
+):
+    client = await hass_ws_client(hass)
+    bundled = types.ModuleType(f"homeassistant.components.{FAKE_DOMAIN}")
+    await _running_pin_with_importers(hass, client, aioclient_mock, fake_wheel, tmp_path, monkeypatch, bundled)
+
+    pin = await _recheck(client)
+
+    assert pin["status"] == "active" and pin["importers"] == "bundled"
+    assert ir.async_get(hass).async_get_issue(DOMAIN, f"pin_not_aliased_{FAKE_DOMAIN}")
+
+    monkeypatch.setitem(
+        sys.modules, bundled.__name__, sys.modules[f"custom_components.{FAKE_DOMAIN}"]
+    )
+    pin = await _recheck(client)
+
+    assert pin["importers"] == "pinned"
+    assert not ir.async_get(hass).async_get_issue(DOMAIN, f"pin_not_aliased_{FAKE_DOMAIN}")
+
+
+async def test_a_pin_written_before_the_alias_only_says_so_in_the_panel(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel, tmp_path, monkeypatch
+):
+    client = await hass_ws_client(hass)
+    bundled = types.ModuleType(f"homeassistant.components.{FAKE_DOMAIN}")
+    override = await _running_pin_with_importers(
+        hass, client, aioclient_mock, fake_wheel, tmp_path, monkeypatch, bundled
+    )
+    (override / alias.SHIM_FILE).unlink()
+
+    pin = await _recheck(client)
+
+    assert pin["importers"] == "bundled" and pin["override"]["alias"] is False
+    assert not ir.async_get(hass).async_get_issue(DOMAIN, f"pin_not_aliased_{FAKE_DOMAIN}")
+
+
+async def test_a_pending_pin_says_nothing_about_importers(
+    hass: HomeAssistant, setup, hass_ws_client, aioclient_mock, fake_wheel
+):
+    _mock_pypi(aioclient_mock, fake_wheel)
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id(
+        {"type": f"{DOMAIN}/pin", "domain": FAKE_DOMAIN, "version": FAKE_VERSION}
+    )
+    assert (await client.receive_json())["success"]
+
+    pin = await _recheck(client)
+
+    assert pin["status"] == "pending" and pin["importers"] is None
+
+
+@pytest.mark.parametrize(("domain", "preimported"), [("http", True), ("recorder", True), ("sun", False)])
+async def test_domain_info_says_when_bootstrap_imports_the_domain_first(
+    hass: HomeAssistant, setup, hass_ws_client, domain, preimported
+):
+    client = await hass_ws_client(hass)
+
+    await client.send_json_auto_id({"type": f"{DOMAIN}/domain_info", "domain": domain})
+
+    assert (await client.receive_json())["result"]["preimported"] is preimported

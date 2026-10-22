@@ -79,3 +79,4 @@ OVERRIDE_ABSENT = "absent"  # nothing was there
 ISSUE_OUT_OF_RANGE = "pin_out_of_range"
 ISSUE_MISSING = "pin_missing"
 ISSUE_FOREIGN = "pin_foreign"
+ISSUE_NOT_ALIASED = "pin_not_aliased"

@@ -65,6 +65,8 @@ Pinned code runs against a newer core than it was written for. Over one or two r
 
 Pins on integrations that others import from, such as `bluetooth`, `mqtt`, `zha`, `recorder` and `http`, are far riskier than pins on ordinary device integrations. The panel warns you but will not stop you.
 
+Integrations built on a pinned one get the pinned code too. Home Assistant loads a pin as `custom_components.<domain>`, while those integrations import `homeassistant.components.<domain>`, so every pin carries a small `_integration_pins_alias.py`, imported from the first lines of its `__init__.py`, that points the second name at the first. Only one copy runs, and an integration that needs something the pinned code lacks fails to set up, with the missing module in the log, rather than quietly using the bundled copy. Compare leaves the alias out, and it does not depend on Integration Pins being installed. It cannot reach everything: Home Assistant imports some integrations (`http`, `recorder`, `sensor`, `frontend` and a few more) before any custom integration loads, and the pin form says so for those. If anything imports the bundled package before the pin loads, the pin's row and a Repair say that importers are still on the bundled code. Pins written before this, and adopted copies, are left as they are; their row says when importers run the bundled code, and Re-pin adds the alias to a release or git pin.
+
 If a pin ever stops Home Assistant from starting, safe mode skips every custom integration, including this one, so the instance comes back up without the pinned code — and without the panel to remove it from. Delete `custom_components/<domain>/` and restart. On Docker or Core that is a file in the config directory you already have; on Home Assistant OS, reach it with the SSH, Samba or File editor add-on, which run whether or not core is healthy.
 
 Home Assistant logs a "custom integration ... has not been tested" warning for every override at startup. That is expected.
@@ -83,6 +85,7 @@ custom_components/integration_pins/
   __init__.py       entry setup, panel registration
   manager.py        orchestrates pins, evaluates ranges, syncs Repair issues
   pinner.py         PyPI and GitHub lookup, download/verify, comparison, extract/retire
+  alias.py          the shim each pin carries so importers of its domain get the pinned code
   uploads.py        folder uploads: HTTP view, validation, in-memory staging
   store.py          .storage/integration_pins persistence
   websocket.py      integration_pins/* commands used by the panel

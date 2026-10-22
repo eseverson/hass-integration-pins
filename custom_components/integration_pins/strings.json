@@ -19,6 +19,10 @@
       "title": "Pinned integration {domain} has no override directory",
       "description": "A pin for `{domain}` (Home Assistant {pinned_version}) is recorded, but `custom_components/{domain}` no longer exists, so the bundled version is what is running. Re-pin it from the Integration Pins panel (for a pin uploaded from a folder, pick its folder again) or remove the pin."
     },
+    "pin_not_aliased": {
+      "title": "Integrations built on {domain} are not running its pin",
+      "description": "The pin for `{domain}` (Home Assistant {pinned_version}) is running, but `homeassistant.components.{domain}` was imported before it loaded, so integrations that import from `{domain}` use the bundled code beside the pin. Home Assistant imports some integrations, such as `http`, `recorder` and `sensor`, before any custom integration loads, and a pin of one of those can never reach its importers. For any other, something that does not wait for `{domain}` to set up imported it first. Unpin it if the pin was meant to change what those integrations get."
+    },
     "pin_foreign": {
       "title": "Override for {domain} was not written by Integration Pins",
       "description": "`custom_components/{domain}` exists but does not carry the marker for the pin recorded here (Home Assistant {pinned_version}). Something else replaced it. Re-pin from the Integration Pins panel to restore the recorded version (for a pin uploaded from a folder, pick its folder again), or adopt the directory as-is. Unpinning removes only the pin and leaves the directory alone."
